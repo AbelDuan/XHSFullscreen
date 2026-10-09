@@ -1,0 +1,130 @@
+name: Build WechatLive LSPosed Module
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 模块 App 自己的进程里没有 XposedBridge。UI 侧任何一个类只要
+      # 直接/间接引用到 de.robv.android.xposed.* 或 MainHook，
+      # 类校验就会 NoClassDefFoundError → 「打开模块就闪退」（v3 的原因）。
+      - name: Guard - UI classes must not touch Xposed
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          BASE = pathlib.Path('app/src/main/java/com/abel/wechatlive')
+          PAT = re.compile(r'de\.robv\.android\.xposed|XposedBridge|XposedHelpers|\bMainHook\b')
+          bad = False
+          for name in ['MainActivity', 'StatusProvider', 'LogStore', 'Const']:
+              src = (BASE / (name + '.java')).read_text(encoding='utf-8')
+              # 先剥离块注释与行注释，避免误伤说明文字
+              code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+              code = re.sub(r'//[^\n]*', '', code)
+              for i, line in enumerate(code.splitlines(), 1):
+                  if PAT.search(line):
+                      print('::error::%s.java:%d 引用了 Xposed/MainHook，会导致模块 App 闪退 -> %s'
+                            % (name, i, line.strip()))
+                      bad = True
+          print('OK: UI 层与 Xposed 完全隔离' if not bad else 'GUARD FAILED')
+          sys.exit(1 if bad else 0)
+          PY
+
+      # LSPosed 在 zygote 里 Class.newInstance() 实例化模块入口类，此时
+      # Looper.getMainLooper() 还是 null。入口类的静态初始化只要碰到
+      # Handler/Looper/Context 就会 ExceptionInInitializerError，
+      # 整个模块在所有进程加载失败 —— 症状是「装了、勾了、但毫无反应且零日志」(v4 的原因)。
+      - name: Guard - entry class static init must not touch Android runtime
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          src = pathlib.Path('app/src/main/java/com/abel/wechatlive/MainHook.java').read_text(encoding='utf-8')
+          code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+          code = re.sub(r'//[^\n]*', '', code)
+          # 静态字段声明里直接构造 Android 运行时对象
+          PAT = re.compile(
+              r'static\s+(?:final\s+)?[A-Za-z0-9_.<>\[\]]+\s+\w+\s*=\s*'
+              r'(?:new\s+(?:Handler|HandlerThread)\b|Looper\.|.*getMainLooper\(\))')
+          bad = False
+          for i, line in enumerate(code.splitlines(), 1):
+              if PAT.search(line):
+                  print('::error::MainHook.java:%d 静态初始化触碰 Android 运行时，'
+                        'zygote 阶段必崩 -> %s' % (i, line.strip()))
+                  bad = True
+          if re.search(r'static\s*\{', code):
+              print('::warning::MainHook 存在 static{} 块，请人工确认未触碰 Handler/Looper/Context')
+          print('OK: 入口类静态初始化是 zygote 安全的' if not bad else 'GUARD FAILED')
+          sys.exit(1 if bad else 0)
+          PY
+
+      # v8.7（LibXposed 迁移）：API 102 硬约束——模块内禁止调用 legacy
+      # de.robv.android.xposed.* API，否则加载即失败。
+      - name: Guard - MainHook must not use legacy XposedBridge API
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          src = pathlib.Path('app/src/main/java/com/abel/wechatlive/MainHook.java').read_text(encoding='utf-8')
+          code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+          code = re.sub(r'//[^\n]*', '', code)
+          PAT = re.compile(r'de\.robv\.android\.xposed|XposedBridge|XposedHelpers|IXposedHookLoadPackage|XC_MethodHook|XC_LoadPackage')
+          bad = False
+          for i, line in enumerate(code.splitlines(), 1):
+              if PAT.search(line):
+                  print('::error::MainHook.java:%d 引用了 legacy Xposed API，API 102 禁止 -> %s'
+                        % (i, line.strip()))
+                  bad = True
+          print('OK: MainHook 纯 LibXposed API' if not bad else 'GUARD FAILED')
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Build debug APK (auto-signed with debug key)
+        uses: gradle/gradle-build-action@v3
+        with:
+          gradle-version: 7.5
+          build-root-directory: .
+          arguments: :app:assembleDebug
+
+      # LSPosed/LibXposed 部分实现加载模块只扫主 dex，入口类必须在 classes.dex 里。
+      # 出现 classes2.dex 就直接让构建失败，避免又产出一个"装了没反应"的包。
+      # v8.7：模块声明从 assets/xposed_init + manifest meta-data 改为 META-INF/xposed/。
+      - name: Verify single-dex & entry class
+        run: |
+          APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
+          echo "APK = $APK"
+          unzip -l "$APK" | grep -E 'classes[0-9]*\.dex|META-INF/xposed/'
+          if unzip -l "$APK" | grep -q 'classes2.dex'; then
+            echo "::error::APK 被拆成多个 dex，入口类可能不在主 dex，LSPosed 会加载失败"
+            exit 1
+          fi
+          for f in module.prop java_init.list scope.list; do
+            if ! unzip -l "$APK" | grep -q "META-INF/xposed/$f"; then
+              echo "::error::APK 缺少 META-INF/xposed/$f，LibXposed 无法识别模块"
+              exit 1
+            fi
+          done
+          unzip -p "$APK" classes.dex > /tmp/c.dex
+          if ! grep -q 'com/abel/wechatlive/MainHook' /tmp/c.dex; then
+            echo "::error::主 dex 中找不到 MainHook 入口类"
+            exit 1
+          fi
+          echo "OK: 单 dex，MainHook 在主 dex，META-INF/xposed 三件套齐全"
+          echo "--- 签名指纹（应每次构建都一致，保证可覆盖安装）---"
+          unzip -p "$APK" META-INF/*.RSA 2>/dev/null | keytool -printcert 2>/dev/null | grep -E 'SHA1|SHA256' || true
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WechatLive-apk
+          path: app/build/outputs/apk/debug/*.apk

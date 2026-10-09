@@ -1,0 +1,51 @@
+apply plugin: 'com.android.application'
+
+android {
+    compileSdkVersion 36
+    defaultConfig {
+        applicationId "com.abel.xhsfullscreen"
+        minSdkVersion 27
+        targetSdkVersion 36
+        versionCode 1
+        versionName "1.0"
+        // 必须单 dex：见 gradle.properties 说明
+        multiDexEnabled false
+    }
+
+    // 固定签名。CI 每次生成随机 debug key 会导致「覆盖安装签名不一致」，
+    // 用仓库内固定 keystore 后，以后所有版本都能直接覆盖安装。
+    signingConfigs {
+        debug {
+            storeFile file('../debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+    }
+
+    buildTypes {
+        debug {
+            signingConfig signingConfigs.debug
+        }
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    lintOptions {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+
+    namespace 'com.abel.xhsfullscreen'
+}
+
+dependencies {
+    // LibXposed 现代 API（compileOnly，不打包进 apk）。API 102 要求：
+    //   1) 模块入口 extends XposedModule（不再 implements 旧版 IXposedHookLoadPackage）
+    //   2) 模块内禁止调用旧版 Xposed API（de.robv.*）
+    //   3) minSdk >= 27（Android 8.1+）
+    // 注意版本号必须是完整的三段式 102.0.0（Central 没有省略式 102 这个版本）
+    compileOnly 'io.github.libxposed:api:102.0.0'
+}

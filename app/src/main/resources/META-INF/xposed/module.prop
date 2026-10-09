@@ -1,0 +1,4 @@
+# LibXposed 模块配置
+minApiVersion=100
+targetApiVersion=102
+# 模块名称取 android:label，描述取 android:description
