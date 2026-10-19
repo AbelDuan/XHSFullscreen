@@ -7,3 +7,5 @@ captures/
 .DS_Store
 *.keystore
 *.jks
+# 例外：固定 debug 签名，用于 CI 产物可覆盖安装（公开的调试密钥，非生产密钥）
+!debug.keystore

@@ -1,4 +1,4 @@
-name: Build WechatLive LSPosed Module
+name: Build XHSFullscreen LSPosed Module
 
 on:
   push:
@@ -18,39 +18,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # 模块 App 自己的进程里没有 XposedBridge。UI 侧任何一个类只要
-      # 直接/间接引用到 de.robv.android.xposed.* 或 MainHook，
-      # 类校验就会 NoClassDefFoundError → 「打开模块就闪退」（v3 的原因）。
-      - name: Guard - UI classes must not touch Xposed
-        run: |
-          python3 - <<'PY'
-          import re, sys, pathlib
-          BASE = pathlib.Path('app/src/main/java/com/abel/wechatlive')
-          PAT = re.compile(r'de\.robv\.android\.xposed|XposedBridge|XposedHelpers|\bMainHook\b')
-          bad = False
-          for name in ['MainActivity', 'StatusProvider', 'LogStore', 'Const']:
-              src = (BASE / (name + '.java')).read_text(encoding='utf-8')
-              # 先剥离块注释与行注释，避免误伤说明文字
-              code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
-              code = re.sub(r'//[^\n]*', '', code)
-              for i, line in enumerate(code.splitlines(), 1):
-                  if PAT.search(line):
-                      print('::error::%s.java:%d 引用了 Xposed/MainHook，会导致模块 App 闪退 -> %s'
-                            % (name, i, line.strip()))
-                      bad = True
-          print('OK: UI 层与 Xposed 完全隔离' if not bad else 'GUARD FAILED')
-          sys.exit(1 if bad else 0)
-          PY
-
       # LSPosed 在 zygote 里 Class.newInstance() 实例化模块入口类，此时
       # Looper.getMainLooper() 还是 null。入口类的静态初始化只要碰到
       # Handler/Looper/Context 就会 ExceptionInInitializerError，
-      # 整个模块在所有进程加载失败 —— 症状是「装了、勾了、但毫无反应且零日志」(v4 的原因)。
+      # 整个模块在所有进程加载失败 —— 症状是「装了、勾了、但毫无反应且零日志」。
       - name: Guard - entry class static init must not touch Android runtime
         run: |
           python3 - <<'PY'
           import re, sys, pathlib
-          src = pathlib.Path('app/src/main/java/com/abel/wechatlive/MainHook.java').read_text(encoding='utf-8')
+          src = pathlib.Path('app/src/main/java/com/abel/xhsfullscreen/MainHook.java').read_text(encoding='utf-8')
           code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
           code = re.sub(r'//[^\n]*', '', code)
           # 静态字段声明里直接构造 Android 运行时对象
@@ -69,13 +45,13 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
-      # v8.7（LibXposed 迁移）：API 102 硬约束——模块内禁止调用 legacy
-      # de.robv.android.xposed.* API，否则加载即失败。
-      - name: Guard - MainHook must not use legacy XposedBridge API
+      # API 102 硬约束：模块内禁止调用 legacy de.robv.android.xposed.* API，
+      # 否则加载即失败。
+      - name: Guard - MainHook must not use legacy Xposed API
         run: |
           python3 - <<'PY'
           import re, sys, pathlib
-          src = pathlib.Path('app/src/main/java/com/abel/wechatlive/MainHook.java').read_text(encoding='utf-8')
+          src = pathlib.Path('app/src/main/java/com/abel/xhsfullscreen/MainHook.java').read_text(encoding='utf-8')
           code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
           code = re.sub(r'//[^\n]*', '', code)
           PAT = re.compile(r'de\.robv\.android\.xposed|XposedBridge|XposedHelpers|IXposedHookLoadPackage|XC_MethodHook|XC_LoadPackage')
@@ -89,16 +65,41 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
-      - name: Build debug APK (auto-signed with debug key)
+      # 防回归：v1 用「measuredWidth < 98% 屏宽」在整棵内容树上强制
+      # requestLayout()，中间测量值被误判 → 首帧窄、随后弹回设定宽度。
+      # 这条守卫确保该兜底扫描不会被重新引入。
+      - name: Guard - no whole-tree requestLayout heuristic (flicker regression)
+        run: |
+          python3 - <<'PY'
+          import re, sys, pathlib
+          src = pathlib.Path('app/src/main/java/com/abel/xhsfullscreen/MainHook.java').read_text(encoding='utf-8')
+          code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+          code = re.sub(r'//[^\n]*', '', code)
+          bad = False
+          PATS = [
+              (re.compile(r'FILL_THRESHOLD'), 'FILL_THRESHOLD 兜底阈值（会造成首帧窄+弹回）'),
+              (re.compile(r'getMeasuredWidth\s*\(\s*\)'), 'getMeasuredWidth() 中间值判断'),
+              (re.compile(r'clearMaxWidth'), 'clearMaxWidth 反射兜底'),
+          ]
+          for i, line in enumerate(code.splitlines(), 1):
+              for pat, why in PATS:
+                  if pat.search(line):
+                      print('::error::MainHook.java:%d 重新引入了抖动兜底逻辑（%s）-> %s'
+                            % (i, why, line.strip()))
+                      bad = True
+          print('OK: 未引入全树兜底扫描' if not bad else 'GUARD FAILED')
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Build debug APK (fixed keystore)
         uses: gradle/gradle-build-action@v3
         with:
           gradle-version: 7.5
           build-root-directory: .
           arguments: :app:assembleDebug
 
-      # LSPosed/LibXposed 部分实现加载模块只扫主 dex，入口类必须在 classes.dex 里。
+      # LibXposed 部分实现加载模块只扫主 dex，入口类必须在 classes.dex 里。
       # 出现 classes2.dex 就直接让构建失败，避免又产出一个"装了没反应"的包。
-      # v8.7：模块声明从 assets/xposed_init + manifest meta-data 改为 META-INF/xposed/。
       - name: Verify single-dex & entry class
         run: |
           APK=$(ls app/build/outputs/apk/debug/*.apk | head -1)
@@ -115,7 +116,7 @@ jobs:
             fi
           done
           unzip -p "$APK" classes.dex > /tmp/c.dex
-          if ! grep -q 'com/abel/wechatlive/MainHook' /tmp/c.dex; then
+          if ! grep -q 'com/abel/xhsfullscreen/MainHook' /tmp/c.dex; then
             echo "::error::主 dex 中找不到 MainHook 入口类"
             exit 1
           fi
@@ -126,5 +127,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: WechatLive-apk
+          name: XHSFullscreen-apk
           path: app/build/outputs/apk/debug/*.apk

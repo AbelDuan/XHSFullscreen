@@ -7,7 +7,6 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 
-import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Set;
@@ -32,11 +31,33 @@ import io.github.libxposed.api.XposedModuleInterface;
  * symmetric gutter down to PAD_TARGET (45px) by:
  *   1. hooking the real (possibly overridden) setPadding / setPaddingRelative
  *      of those containers, and
- *   2. re-clamping on every layout pass (belt & braces).
+ *   2. re-clamping the targeted containers on resume / config change.
  *
- * The first-level feed is untouched (no maxWidth / no density spoof), so the
- * multi-column layout is preserved.
+ * ---------------------------------------------------------------------------
+ * v2 — fixes the "opens narrow, then snaps to the configured width" flicker.
+ * ---------------------------------------------------------------------------
+ * v1 additionally walked the WHOLE content tree (depth <= 6) and, for every
+ * view whose LayoutParams.width was MATCH_PARENT, compared getMeasuredWidth()
+ * against 98% of the screen width. During the post()/postDelayed() passes the
+ * measured width of many children is still a not-yet-final intermediate value,
+ * so those views were misclassified as "artificially narrowed" and got a
+ * requestLayout() + setLayoutParams() forced onto them. Several of those in a
+ * row produce a measurement storm: the first frame renders at the narrow
+ * intermediate width and only settles (visibly "snapping") once the extra
+ * layout passes finish.
+ *
+ * The same pass also clamped symmetric L/R *margins* and reflected into a
+ * "maxWidth" field on arbitrary LayoutParams objects, which silently fails on
+ * most subclasses. All of that is gone in v2:
+ *
+ *   - Only the explicitly targeted classes are ever touched.
+ *   - Every clamp is idempotent: if the value is already correct we do not
+ *     write it and do not requestLayout(), so no layout ping-pong.
+ *   - The global-layout listener removes itself once the clamp has settled.
+ *   - The ImageView/timer-driven depth walk and the maxWidth reflection are
+ *     removed entirely.
  */
+
 public class MainHook extends XposedModule {
 
     private static final String TAG = "XHSFullscreen";
@@ -50,9 +71,6 @@ public class MainHook extends XposedModule {
     private static final int PAD_THRESHOLD = 64;
     // Keep this much left/right gutter (px) instead of clearing to 0.
     private static final int PAD_TARGET = 45;
-    // A MATCH_PARENT container whose measured width is below this fraction of
-    // the screen is considered artificially narrowed and gets maxWidth cleared.
-    private static final float FILL_THRESHOLD = 0.98f;
 
     // Real (possibly overridden) classes whose setPadding we have already
     // hooked. Keyed by class name; bounded and never reset.
@@ -153,44 +171,35 @@ public class MainHook extends XposedModule {
                 final Method sp = c.getDeclaredMethod(
                         "setPadding", int.class, int.class, int.class, int.class);
                 sp.setAccessible(true);
-                hook(sp).intercept(chain -> {
-                    try {
-                        List<Object> args = chain.getArgs();
-                        int l = (Integer) args.get(0);
-                        int r = (Integer) args.get(2);
-                        if (l == r && l >= PAD_THRESHOLD) {
-                            args.set(0, PAD_TARGET);
-                            args.set(2, PAD_TARGET);
-                            return chain.proceedWith(args);
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                    return chain.proceed();
-                });
+                hook(sp).intercept(clampHookFor());
             } catch (Throwable ignored) {
             }
             try {
                 final Method spr = c.getDeclaredMethod(
                         "setPaddingRelative", int.class, int.class, int.class, int.class);
                 spr.setAccessible(true);
-                hook(spr).intercept(chain -> {
-                    try {
-                        List<Object> args = chain.getArgs();
-                        int l = (Integer) args.get(0);
-                        int r = (Integer) args.get(2);
-                        if (l == r && l >= PAD_THRESHOLD) {
-                            args.set(0, PAD_TARGET);
-                            args.set(2, PAD_TARGET);
-                            return chain.proceedWith(args);
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                    return chain.proceed();
-                });
+                hook(spr).intercept(clampHookFor());
             } catch (Throwable ignored) {
             }
             c = c.getSuperclass();
         }
+    }
+
+    private XposedInterface.Hooker clampHookFor() {
+        return chain -> {
+            try {
+                List<Object> args = chain.getArgs();
+                int l = (Integer) args.get(0);
+                int r = (Integer) args.get(2);
+                if (l == r && l >= PAD_THRESHOLD) {
+                    args.set(0, PAD_TARGET);
+                    args.set(2, PAD_TARGET);
+                    return chain.proceedWith(args);
+                }
+            } catch (Throwable ignored) {
+            }
+            return chain.proceed();
+        };
     }
 
     private void scheduleFix(final Activity a) {
@@ -199,11 +208,10 @@ public class MainHook extends XposedModule {
             if (decor == null) {
                 return;
             }
-            // Run now...
             decor.post(() -> fixContent(a));
-            // ...and again after the comment list has had time to load
-            // asynchronously (the comment container is created AFTER onResume,
-            // so a single pass would miss it and XHS would reset the padding).
+            // The comment container is created AFTER onResume, so a single pass
+            // would miss it and XHS would reset the padding. Two later passes
+            // cover the async comment load.
             decor.postDelayed(() -> fixContent(a), 300);
             decor.postDelayed(() -> fixContent(a), 800);
         } catch (Throwable t) {
@@ -226,6 +234,10 @@ public class MainHook extends XposedModule {
         }
     }
 
+    /**
+     * Walk the tree looking ONLY for the targeted container classes. Everything
+     * else is left completely untouched — that is what keeps the layout stable.
+     */
     private void fixView(View v, int depth, Activity a) {
         if (v == null || depth > MAX_DEPTH) {
             return;
@@ -241,63 +253,11 @@ public class MainHook extends XposedModule {
                         hookPaddingSetters(v.getClass());
                     }
                 }
-                // Belt & braces: re-clamp on every layout pass. When XHS sets
-                // 189 again, a re-layout fires and we clamp back to PAD_TARGET.
-                final View fv = v;
-                fv.getViewTreeObserver().addOnGlobalLayoutListener(
-                        new ViewTreeObserver.OnGlobalLayoutListener() {
-                            private boolean busy = false;
-                            @Override
-                            public void onGlobalLayout() {
-                                if (busy) {
-                                    return;
-                                }
-                                busy = true;
-                                try {
-                                    int l = fv.getPaddingLeft();
-                                    int r = fv.getPaddingRight();
-                                    if (l == r && l >= PAD_THRESHOLD) {
-                                        fv.setPadding(PAD_TARGET, fv.getPaddingTop(),
-                                                PAD_TARGET, fv.getPaddingBottom());
-                                    }
-                                } catch (Throwable ignored) {
-                                }
-                                busy = false;
-                            }
-                        });
-            }
-
-            // One-shot clamp for any symmetric large L/R padding on this view.
-            int pl = v.getPaddingLeft();
-            int pr = v.getPaddingRight();
-            if (pl == pr && pl >= PAD_THRESHOLD) {
-                v.setPadding(PAD_TARGET, v.getPaddingTop(), PAD_TARGET, v.getPaddingBottom());
-            }
-
-            // Also clamp symmetric large L/R margins (some layouts use margins).
-            ViewGroup.LayoutParams lp0 = v.getLayoutParams();
-            if (lp0 instanceof ViewGroup.MarginLayoutParams) {
-                ViewGroup.MarginLayoutParams mlp = (ViewGroup.MarginLayoutParams) lp0;
-                int ml = mlp.leftMargin, mr = mlp.rightMargin;
-                if (ml == mr && ml >= PAD_THRESHOLD) {
-                    mlp.leftMargin = PAD_TARGET;
-                    mlp.rightMargin = PAD_TARGET;
-                    v.setLayoutParams(mlp);
-                }
-            }
-
-            // Fallback: clear maxWidth on any MATCH_PARENT container that is
-            // still measured narrower than the screen.
-            ViewGroup.LayoutParams lp = v.getLayoutParams();
-            if (lp != null && lp.width == MATCH_PARENT) {
-                int screenW = a.getResources().getDisplayMetrics().widthPixels;
-                int measured = v.getMeasuredWidth();
-                if (measured > 0 && measured < screenW * FILL_THRESHOLD) {
-                    clearMaxWidth(lp);
-                    lp.width = MATCH_PARENT;
-                    v.setLayoutParams(lp);
-                    v.requestLayout();
-                }
+                clampPadding(v);
+                // Self-terminating guard: keeps clamping while XHS re-sets the
+                // padding after comments load, then removes itself so it stops
+                // driving layout once the value has settled.
+                attachLayoutGuard(v);
             }
         } catch (Throwable ignored) {
         }
@@ -309,11 +269,62 @@ public class MainHook extends XposedModule {
         }
     }
 
-    private void clearMaxWidth(ViewGroup.LayoutParams lp) {
+    /**
+     * Idempotent clamp: writes only when the value actually needs changing, so
+     * a settled layout is never disturbed.
+     */
+    private static void clampPadding(View v) {
         try {
-            Field f = lp.getClass().getDeclaredField("maxWidth");
-            f.setAccessible(true);
-            f.set(lp, Integer.MAX_VALUE);
+            int l = v.getPaddingLeft();
+            int r = v.getPaddingRight();
+            if (l == r && l >= PAD_THRESHOLD) {
+                v.setPadding(PAD_TARGET, v.getPaddingTop(), PAD_TARGET, v.getPaddingBottom());
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Re-clamp on layout passes caused by XHS's own async padding re-set, and
+     * detach once the padding has stayed correct for a while. v1 kept the
+     * listener alive forever, so every layout pass wrote padding again.
+     */
+    private static void attachLayoutGuard(final View v) {
+        try {
+            final int[] settled = {0};
+            final ViewTreeObserver.OnGlobalLayoutListener[] holder = new ViewTreeObserver.OnGlobalLayoutListener[1];
+            ViewTreeObserver.OnGlobalLayoutListener l = new ViewTreeObserver.OnGlobalLayoutListener() {
+                private boolean busy = false;
+
+                @Override
+                public void onGlobalLayout() {
+                    if (busy) {
+                        return;
+                    }
+                    busy = true;
+                    try {
+                        int cur = v.getPaddingLeft();
+                        if (cur == v.getPaddingRight() && cur >= PAD_THRESHOLD) {
+                            v.setPadding(PAD_TARGET, v.getPaddingTop(),
+                                    PAD_TARGET, v.getPaddingBottom());
+                            settled[0] = 0;
+                        } else if (cur == PAD_TARGET) {
+                            // Correct and stable: stop listening after a few
+                            // consecutive clean passes.
+                            if (++settled[0] >= 3) {
+                                try {
+                                    v.getViewTreeObserver().removeOnGlobalLayoutListener(holder[0]);
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    busy = false;
+                }
+            };
+            holder[0] = l;
+            v.getViewTreeObserver().addOnGlobalLayoutListener(l);
         } catch (Throwable ignored) {
         }
     }
