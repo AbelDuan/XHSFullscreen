@@ -76,6 +76,11 @@ public class MainHook extends XposedModule {
     // Keep this much left/right gutter (px) instead of clearing to 0.
     private static final int PAD_TARGET = 45;
 
+    // PreDraw 守卫连续观察到的稳定帧数；达到后自行摘除监听。
+    // 稳定后每帧的回调只剩开销没有收益，摘掉可省掉持续的对象分配与检查。
+    // 取 30 帧（约 0.25~0.5 秒），足够覆盖小红书异步重设边距的窗口。
+    private static final int GUARD_STABLE_FRAMES = 30;
+
     // Real (possibly overridden) classes whose setPadding we have already
     // hooked. Keyed by class name; bounded and never reset.
     private static final Set<String> hookedClasses = new HashSet<>();
@@ -279,11 +284,12 @@ public class MainHook extends XposedModule {
             hook(onMeasure).intercept(chain -> {
                 try {
                     Object self = chain.getThisObject();
-                    if (self instanceof View && isTarget(((View) self).getClass().getName())) {
-                        // 关键：在 measure 之前先把 padding 归一。
-                        // measure 早于 layout / draw，也早于任何帧被合成，
-                        // 因此「打开前就定好」在这里成立 —— 不存在中间态。
-                        clampPadding((View) self);
+                    if (self instanceof View && isTargetClass(self.getClass())) {
+                        // ⚠ 这里不能写 padding！
+                        // setPadding 会触发 requestLayout，而在 onMeasure 进行中
+                        // 触发重新布局是非法时机：CommentListView 内部的 RecyclerView
+                        // 会被重排、滚动位置复位 —— 表现为「屏幕外的评论弹出来再看
+                        // 着再弹回去」。padding 的归一只交给 PreDraw（绘制前，安全）。
 
                         List<Object> args = chain.getArgs();
                         int wSpec = (Integer) args.get(0);
@@ -374,6 +380,24 @@ public class MainHook extends XposedModule {
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "hook onConfigurationChanged failed: " + t);
         }
+    }
+
+    /**
+     * View.onMeasure 上挂着一个 hook，会被每次测量回调 —— 也就是滑动时
+     * 每秒上万次。这里用 Class 身份缓存把判断压到一次 HashMap 查表：
+     * 第一次见到的 Class 才做字符串匹配，之后直接查 Cache。
+     * 未命中缓存的非目标类会被记为 FALSE，不会重复做字符串匹配。
+     */
+    private static final ClassValue<Boolean> TARGET_CACHE = new ClassValue<Boolean>() {
+        @Override
+        protected Boolean computeValue(Class<?> type) {
+            return isTarget(type.getName()) ? Boolean.TRUE : Boolean.FALSE;
+        }
+    };
+
+    /** 热路径版本：Class 缓存，无字符串分配。 */
+    private static boolean isTargetClass(Class<?> cls) {
+        return TARGET_CACHE.get(cls);
     }
 
     private static boolean isTarget(String cn) {
@@ -663,22 +687,34 @@ public class MainHook extends XposedModule {
      */
     private static void attachLayoutGuard(final View v) {
         try {
-            final ViewTreeObserver.OnPreDrawListener l = new ViewTreeObserver.OnPreDrawListener() {
+            final String cn = v.getClass().getName();
+            final boolean outer = isOuterContainer(cn);
+            final boolean gutter = needsGutter(cn);
+            final int want = outer ? 0 : (gutter ? PAD_TARGET : -1);
+            final ViewTreeObserver.OnPreDrawListener l =
+                    new ViewTreeObserver.OnPreDrawListener() {
                 private int frame = 0;
+                private int stable = 0;
 
                 @Override
                 public boolean onPreDraw() {
                     try {
-                        String cn = v.getClass().getName();
-                        int cur = v.getPaddingLeft();
-                        // 目标：内容区 45px；外层容器保持 0，否则会挤压子视图
-                        int want = isOuterContainer(cn) ? 0
-                                : (needsGutter(cn) ? PAD_TARGET : cur);
-                        boolean changed = false;
-                        if (cur != want) {
-                            v.setPadding(want, v.getPaddingTop(),
-                                    want, v.getPaddingBottom());
-                            changed = true;
+                        // want < 0 表示这既不是外层也不是内容区，无需干预
+                        if (want >= 0) {
+                            int cur = v.getPaddingLeft();
+                            if (cur != want || v.getPaddingRight() != want) {
+                                v.setPadding(want, v.getPaddingTop(),
+                                        want, v.getPaddingBottom());
+                                stable = 0;
+                            } else if (++stable >= GUARD_STABLE_FRAMES) {
+                                // 稳定后自行摘除：此后不再每帧回调，
+                                // 避免持续的对象分配与检查开销。
+                                v.getViewTreeObserver().removeOnPreDrawListener(this);
+                                v.setTag(TAG_GUARD, null);
+                            }
+                        } else {
+                            v.getViewTreeObserver().removeOnPreDrawListener(this);
+                            v.setTag(TAG_GUARD, null);
                         }
 
                         if (VERBOSE && frame < 20) {
@@ -686,9 +722,8 @@ public class MainHook extends XposedModule {
                             if (m != null) {
                                 m.log(Log.INFO, TAG, "FRAME " + frame + " "
                                         + v.getClass().getSimpleName()
-                                        + " pad=" + cur + "->" + want
-                                        + " w=" + v.getWidth()
-                                        + (changed ? " [fixed]" : ""));
+                                        + " pad=" + v.getPaddingLeft()
+                                        + " want=" + want + " w=" + v.getWidth());
                             }
                             frame++;
                         }
