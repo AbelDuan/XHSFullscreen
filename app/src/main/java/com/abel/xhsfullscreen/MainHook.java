@@ -77,9 +77,14 @@ public class MainHook extends XposedModule {
 
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
+        // 入口可观测性：LSPosed 每次把本模块注入目标进程都会经过这里。
+        // 没有这条日志就无法区分「模块没被加载」和「加载了但逻辑没命中」——
+        // 排查时那是两个完全不同的方向，所以保留为常规 INFO 输出。
+        log(Log.INFO, TAG, "onPackageLoaded: " + param.getPackageName());
         if (!XHS.equals(param.getPackageName())) {
             return;
         }
+        log(Log.INFO, TAG, "hooked into XHS, installing hooks (v1.1)");
 
         // Reschedule the fix on every resume / config change (e.g. fold/unfold).
         hookActivityLifecycle();
@@ -244,6 +249,9 @@ public class MainHook extends XposedModule {
         try {
             String cn = v.getClass().getName();
             if (isTarget(cn)) {
+                log(Log.INFO, TAG, "target hit: " + cn
+                        + " pad=" + v.getPaddingLeft() + "/" + v.getPaddingRight()
+                        + " w=" + v.getWidth());
                 // Hook the real class's setters so XHS's override (and async
                 // re-sets) are intercepted. Done once per class.
                 synchronized (hookedClasses) {
