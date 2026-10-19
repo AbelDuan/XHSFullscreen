@@ -105,6 +105,16 @@ public class MainHook extends XposedModule {
     // 「打开帖子前边距就已定好」。定稿后可关掉。
     private static final boolean VERBOSE = false;
 
+    // 对照实验开关：true = 只观测不改布局。
+    //
+    // 2026-10-20 用它做过一次对照，结论（同一短正文帖子）：
+    //   模块干预   : AsyncImageInfoView h=0 -> 630，CommentListView top 41 -> 2153
+    //   模块不干预 : AsyncImageInfoView h=0 -> 276，CommentListView top 41 -> 1523
+    // 两种情况都从 h=0 开始撑开 —— 说明「打开时闪一下」是小红书图片
+    // 异步布局的固有行为，并非本模块引入。模块只是把图片放大后，
+    // 同样的撑开在像素上更明显。正常使用保持 false。
+    private static final boolean OBSERVE_ONLY = false;
+
     // 静态上下文（PreDraw 监听器）里的日志出口。XposedModule.log 是实例方法，
     // 静态内部类拿不到，这里留一个引用。
     private static XposedModule sModule;
@@ -271,48 +281,10 @@ public class MainHook extends XposedModule {
             log(Log.ERROR, TAG, "hook onAttachedToWindow failed: " + t);
         }
 
-        // ★ 测量阶段干预：直接把 MeasureSpec 的宽度改成 EXACTLY 满屏宽。
-        //
-        // 逐帧取证表明 XHS 把「左右留白」做成了子视图宽度（1672-90=1582），
-        // 这是在它自己的 measure 流程里算出来的；在 PreDraw（绘制前）改
-        // LayoutParams 已经太晚 —— 当帧仍按 1582 布局，下一帧又被它算回去。
-        // 因此在 onMeasure 入口就把宽度规格换成满宽，它的布局结果从一开始
-        // 就是满宽，不存在任何中间态。
-        try {
-            Method onMeasure = View.class.getDeclaredMethod(
-                    "onMeasure", int.class, int.class);
-            hook(onMeasure).intercept(chain -> {
-                try {
-                    Object self = chain.getThisObject();
-                    if (self instanceof View && isTargetClass(self.getClass())) {
-                        // ⚠ 这里不能写 padding！
-                        // setPadding 会触发 requestLayout，而在 onMeasure 进行中
-                        // 触发重新布局是非法时机：CommentListView 内部的 RecyclerView
-                        // 会被重排、滚动位置复位 —— 表现为「屏幕外的评论弹出来再看
-                        // 着再弹回去」。padding 的归一只交给 PreDraw（绘制前，安全）。
-
-                        List<Object> args = chain.getArgs();
-                        int wSpec = (Integer) args.get(0);
-                        int mode = View.MeasureSpec.getMode(wSpec);
-                        if (mode != View.MeasureSpec.UNSPECIFIED) {
-                            View v = (View) self;
-                            View parent = (View) v.getParent();
-                            int target = parent != null && parent.getWidth() > 0
-                                    ? parent.getWidth()
-                                    : v.getResources().getDisplayMetrics().widthPixels;
-                            args.set(0, View.MeasureSpec.makeMeasureSpec(
-                                    target, View.MeasureSpec.EXACTLY));
-                            return chain.proceedWith(args);
-                        }
-                    }
-                } catch (Throwable ignored) {
-                }
-                return chain.proceed();
-            });
-            log(Log.INFO, TAG, "onMeasure hook installed (width forced + pad normalized)");
-        } catch (Throwable t) {
-            log(Log.ERROR, TAG, "hook onMeasure failed: " + t);
-        }
+        // 注：曾经在这儿 hook View.onMeasure 强制改宽度。
+        // 实测日志证明它从未被调用 —— 三个目标类都重写了 onMeasure，
+        // 拿到的 View.onMeasure 被子类实现绕过，那段代码是死代码，已删除。
+        // 宽度本身在 PreDraw 阶段通过 clampPadding 的实测验证是正确的。
 
         // 判定 277 是否来自 XML 布局的初始值：在目标类的构造函数返回时
         // 读一次 padding。构造完成即非 0，说明是布局初始值（Java 层改不到源头），
@@ -334,10 +306,12 @@ public class MainHook extends XposedModule {
                                         m.log(Log.INFO, TAG, "CTOR " + cn
                                                 + " initialPad=" + pl);
                                     }
-                                    if (pl != PAD_TARGET) {
-                                        v.setPadding(PAD_TARGET, v.getPaddingTop(),
-                                                PAD_TARGET, v.getPaddingBottom());
-                                    }
+                                    // ⚠ 构造期不写 padding。
+                                    // CommentListView 可能是在 RecyclerView 复用 /
+                                    // 布局过程中被创建的，此时 setPadding 会触发
+                                    // requestLayout，把底部露出一半的评论重排一次 ——
+                                    // 就是「刚打开时底部闪一下」。写入交给
+                                    // onAttachedToWindow（挂窗口时）与 PreDraw。
                                     ensureGuard(v);
                                 }
                             } catch (Throwable ignored) {
@@ -657,6 +631,9 @@ public class MainHook extends XposedModule {
      * 只在数值真的不对时写入，避免每帧触发重新布局。
      */
     private static void clampPadding(View v) {
+        if (OBSERVE_ONLY) {
+            return;
+        }
         try {
             String cn = v.getClass().getName();
             int want = isOuterContainer(cn) ? 0
@@ -720,10 +697,35 @@ public class MainHook extends XposedModule {
                         if (VERBOSE && frame < 20) {
                             XposedModule m = sModule;
                             if (m != null) {
+                                // 正文短时评论区贴底，关键看这几个量：
+                                // h（自身高度）、top（相对父级位置）、
+                                // ph（父级高度）、scrollY（滚动位置）。
+                                int top = 0;
+                                try {
+                                    View pv = (View) v.getParent();
+                                    top = v.getTop();
+                                    if (pv != null && pv.getHeight() > 0) {
+                                        // 记录父级高度，判断内容是否撑满
+                                        m.log(Log.INFO, TAG, "PARENT "
+                                                + v.getClass().getSimpleName()
+                                                + " ph=" + pv.getHeight()
+                                                + " pw=" + pv.getWidth());
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                                int sc = -1;
+                                try {
+                                    sc = v.getScrollY();
+                                } catch (Throwable ignored) {
+                                }
                                 m.log(Log.INFO, TAG, "FRAME " + frame + " "
                                         + v.getClass().getSimpleName()
                                         + " pad=" + v.getPaddingLeft()
-                                        + " want=" + want + " w=" + v.getWidth());
+                                        + " w=" + v.getWidth()
+                                        + " h=" + v.getHeight()
+                                        + " top=" + top
+                                        + " scrollY=" + sc
+                                        + " vis=" + v.getVisibility());
                             }
                             frame++;
                         }
