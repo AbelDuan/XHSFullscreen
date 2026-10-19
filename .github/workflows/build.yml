@@ -91,12 +91,14 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
-      - name: Build debug APK (fixed keystore)
-        uses: gradle/gradle-build-action@v3
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 7.5
-          build-root-directory: .
-          arguments: :app:assembleDebug
+          # AGP 8.13.2 要求 Gradle >= 8.13；此前写 7.5 会让 :app 评估失败。
+          gradle-version: 8.13
+
+      - name: Build debug APK (fixed keystore)
+        run: gradle :app:assembleDebug --no-daemon
 
       # LibXposed 部分实现加载模块只扫主 dex，入口类必须在 classes.dex 里。
       # 出现 classes2.dex 就直接让构建失败，避免又产出一个"装了没反应"的包。
