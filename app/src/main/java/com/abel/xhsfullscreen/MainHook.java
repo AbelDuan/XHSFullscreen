@@ -62,7 +62,6 @@ public class MainHook extends XposedModule {
 
     private static final String TAG = "XHSFullscreen";
     private static final String XHS = "com.xingin.xhs";
-    private static final int MATCH_PARENT = -1;
     private static final int MAX_DEPTH = 6;
 
     // Symmetric L/R padding at/above this (px) is treated as the detail-page
