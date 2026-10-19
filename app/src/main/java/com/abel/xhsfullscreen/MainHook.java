@@ -186,6 +186,54 @@ public class MainHook extends XposedModule {
             }
         }
 
+        // ★ 修「正文短的帖子打开时评论区弹一下」。
+        //
+        // REA 反编译 com.xingin.matrix.base.widgets.NestedScrollLayout.onMeasure 得到：
+        //
+        //   measureChild(this.i, i, makeMeasureSpec(0, 0));   // 标题栏按 UNSPECIFIED 测
+        //   int measuredHeight = this.i.getMeasuredHeight();  // 标题栏量完才知道高度
+        //   int last = this.F;
+        //   if (last > 0 && last != measuredHeight && this.B > 0) {
+        //       int d = last - measuredHeight;
+        //       this.B = d > 0 ? Math.max(0, this.B - d) : this.B - d;  // ← 主动改滚动偏移
+        //   }
+        //   this.F = measuredHeight;
+        //
+        // this.B 是滚动偏移，this.i 是标题栏。标题栏高度一变，它就把滚动偏移
+        // 改成「高度差」，内容整体位移 —— 就是肉眼看到的弹一下。
+        // 正文越短，滚动偏移越接近 0，这个分支越容易被触发且幅度明显。
+        //
+        // 处理：在 onMeasure 前后把 this.B 还原成进入时的值，抵消它的自我修正。
+        // 只动这一个字段，不碰标题栏测量与布局逻辑本身。
+        try {
+            Class<?> nsl = Class.forName(
+                    "com.xingin.matrix.base.widgets.NestedScrollLayout", false, cl0);
+            java.lang.reflect.Field fB = nsl.getDeclaredField("B");
+            fB.setAccessible(true);
+            Method om = nsl.getDeclaredMethod("onMeasure", int.class, int.class);
+            om.setAccessible(true);
+            hook(om).intercept(chain -> {
+                Object self = chain.getThisObject();
+                int before = 0;
+                try {
+                    before = fB.getInt(self);
+                } catch (Throwable ignored) {
+                }
+                Object r = chain.proceed();
+                try {
+                    int after = fB.getInt(self);
+                    if (after != before) {
+                        fB.setInt(self, before);
+                    }
+                } catch (Throwable ignored) {
+                }
+                return r;
+            });
+            log(Log.INFO, TAG, "hooked NestedScrollLayout.onMeasure (scroll offset pinned)");
+        } catch (Throwable t) {
+            log(Log.INFO, TAG, "NestedScrollLayout hook skipped: " + t);
+        }
+
         // 探针：把调用栈里出现的混淆类的方法签名打出来，
         // 便于把「wj9.c0.y0」映射到真实签名（后续要 hook 它的返回值）。
         // 类名来自滑动窗口取证：CLAMP 调用栈里的 wj9/c0.y0 是计算边距的核心。
