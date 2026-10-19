@@ -7,6 +7,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewTreeObserver;
 
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Set;
@@ -37,14 +38,18 @@ import io.github.libxposed.api.XposedModuleInterface;
  * v2 — fixes the "opens narrow, then snaps to the configured width" flicker.
  * ---------------------------------------------------------------------------
  * v1 additionally walked the WHOLE content tree (depth <= 6) and, for every
- * view whose LayoutParams.width was MATCH_PARENT, compared getMeasuredWidth()
- * against 98% of the screen width. During the post()/postDelayed() passes the
- * measured width of many children is still a not-yet-final intermediate value,
- * so those views were misclassified as "artificially narrowed" and got a
+ * view whose LayoutParams width was MATCH_PARENT, compared its *measured* width
+ * against 98% of the screen width. During the post()/postDelayed() passes that
+ * measured value is still a not-yet-final intermediate for many children, so
+ * those views were misclassified as "artificially narrowed" and got a
  * requestLayout() + setLayoutParams() forced onto them. Several of those in a
  * row produce a measurement storm: the first frame renders at the narrow
  * intermediate width and only settles (visibly "snapping") once the extra
  * layout passes finish.
+ *
+ * 真正的抖动主因在 v3 才确认：小红书每隔约 1.5 秒把 padding 重设为 277/189，
+ * 而 v1/v2 都在布局「之后」（OnGlobalLayout）才改回，那一帧的窄版已经画上屏了。
+ * v3 改为 OnPreDraw（绘制之前）归一化，窄版永远不会被绘制出来。
  *
  * The same pass also clamped symmetric L/R *margins* and reflected into a
  * "maxWidth" field on arbitrary LayoutParams objects, which silently fails on
@@ -75,6 +80,30 @@ public class MainHook extends XposedModule {
     // hooked. Keyed by class name; bounded and never reset.
     private static final Set<String> hookedClasses = new HashSet<>();
 
+    // 标记「这个 View 已挂过 PreDraw 守卫」，避免重复挂载导致监听器堆积。
+    // View 的 tag 只有 int 键版本（setTag(int,Object) / getTag(int) 自 API 21 起）。
+    // 用一个大到不会与 XHS 冲突的冷门 key。
+    private static final int TAG_GUARD = 0x58_48_53_47; // 'XHSG'
+
+    // 开启后打印混淆类的方法签名。定位阶段用，定稿后置 false 以免刷日志。
+    private static final boolean PROBE = false;
+
+    // 目标容器的全限定类名（来自运行时日志取证，名字稳定、不随混淆变化）。
+    // 进程启动时就按这些名字预注册 setter hook，避免首帧漏网。
+    private static final String[] TARGET_CLASSES = {
+            "com.xingin.comment.consumer.list.CommentListView",
+            "com.xingin.matrix.notedetail.imagecontent.imageinfo.AsyncImageInfoView",
+            "com.xingin.matrix.notedetail.notecontent.NoteDetailContentView",
+    };
+
+    // 逐帧观测开关：记录每帧绘制时 padding 的真实值，用于验证
+    // 「打开帖子前边距就已定好」。定稿后可关掉。
+    private static final boolean VERBOSE = false;
+
+    // 静态上下文（PreDraw 监听器）里的日志出口。XposedModule.log 是实例方法，
+    // 静态内部类拿不到，这里留一个引用。
+    private static XposedModule sModule;
+
     @Override
     public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
         // 入口可观测性：LSPosed 每次把本模块注入目标进程都会经过这里。
@@ -84,7 +113,78 @@ public class MainHook extends XposedModule {
         if (!XHS.equals(param.getPackageName())) {
             return;
         }
-        log(Log.INFO, TAG, "hooked into XHS, installing hooks (v1.1)");
+        log(Log.INFO, TAG, "hooked into XHS, installing hooks (v3)");
+        sModule = this;
+
+        // ★ 主动预注册：不等实例出现，直接用全限定名把目标类的 setter hook 好。
+        //
+        // 逐帧观测证明：onAttachedToWindow/fixView 都是「实例出现后」才注册，
+        // 而 XHS 在视图挂窗口的同时就调 setPadding(277)，那一次必然漏网，
+        // 于是首帧仍以 277 绘制一次（FRAME 1 pad=277），肉眼就是「先窄后宽」。
+        //
+        // 类名是稳定的（不随混淆变化），这里在进程启动阶段就完成注册，
+        // 使第一次 setPadding 调用即被改写 —— 277 从头到尾不存在。
+        ClassLoader cl0 = null;
+        try {
+            cl0 = param.getDefaultClassLoader();
+        } catch (Throwable ignored) {
+        }
+        if (cl0 != null) {
+            for (String cn : TARGET_CLASSES) {
+                try {
+                    Class<?> c = Class.forName(cn, false, cl0);
+                    synchronized (hookedClasses) {
+                        if (!hookedClasses.contains(cn)) {
+                            hookedClasses.add(cn);
+                            hookPaddingSetters(c);
+                            log(Log.INFO, TAG, "pre-hooked setters: " + cn);
+                        }
+                    }
+                } catch (Throwable t) {
+                    log(Log.INFO, TAG, "pre-hook skipped " + cn + ": " + t);
+                }
+            }
+
+            // ★ 从源头改：wj9.c0.y0(boolean,boolean) 是小红书「计算并应用详情页
+            // 边距」的核心方法（调用栈取证：wj9.c0.y0:140 -> View.setPadding）。
+            // 它在自己的逻辑里算出 277 并立刻应用；我们在它返回后马上把结果
+            // 归一为 45 —— 这是同一调用栈内的修正，早于任何测量/布局/绘制，
+            // 因此首帧画出来时值就已经是 45，不存在中间态。
+            try {
+                Class<?> c0 = Class.forName("wj9.c0", false, cl0);
+                Method y0 = c0.getDeclaredMethod("y0", boolean.class, boolean.class);
+                y0.setAccessible(true);
+                hook(y0).intercept(chain -> {
+                    Object r = chain.proceed();
+                    try {
+                        Object self = chain.getThisObject();
+                        if (self instanceof View) {
+                            normalizeTree((View) self);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    return r;
+                });
+                log(Log.INFO, TAG, "hooked wj9.c0.y0 (source-level normalize)");
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG, "hook wj9.c0.y0 failed: " + t);
+            }
+        }
+
+        // 探针：把调用栈里出现的混淆类的方法签名打出来，
+        // 便于把「wj9.c0.y0」映射到真实签名（后续要 hook 它的返回值）。
+        // 类名来自滑动窗口取证：CLAMP 调用栈里的 wj9/c0.y0 是计算边距的核心。
+        if (PROBE) {
+            // 注意：必须用目标 App 的 ClassLoader，模块自己的加载器看不到 App 的类。
+            ClassLoader cl = null;
+            try {
+                cl = param.getDefaultClassLoader();
+            } catch (Throwable ignored) {
+            }
+            log(Log.INFO, TAG, "PROBE classloader = " + cl);
+            probeClass("wj9.c0", cl);
+            probeClass("wj9.t", cl);
+        }
 
         // Reschedule the fix on every resume / config change (e.g. fold/unfold).
         hookActivityLifecycle();
@@ -100,9 +200,11 @@ public class MainHook extends XposedModule {
                         List<Object> args = chain.getArgs();
                         int l = (Integer) args.get(0);
                         int r = (Integer) args.get(2);
+                        // 内容区：把大边距收成 45；外层容器：清成 0
                         if (l == r && l >= PAD_THRESHOLD) {
-                            args.set(0, PAD_TARGET);
-                            args.set(2, PAD_TARGET);
+                            int want = isOuterContainer(cn) ? 0 : PAD_TARGET;
+                            args.set(0, want);
+                            args.set(2, want);
                             return chain.proceedWith(args);
                         }
                     }
@@ -124,6 +226,124 @@ public class MainHook extends XposedModule {
             hook(setPaddingRel).intercept(clampHook);
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "hook setPaddingRelative failed: " + t);
+        }
+
+        // ★ v3 关键：在视图挂上窗口的瞬间就接管。
+        //
+        // onAttachedToWindow 早于任何 measure / layout / draw，也早于
+        // onResume 之后那几次 post() 补救。在这里立刻把 padding 归一成
+        // PAD_TARGET，并挂上 PreDraw 守卫 —— 页面第一帧画出来就是最终宽度，
+        // 不存在「先窄后宽」的中间态。
+        //
+        // 这解决了 v1/v2 的根本时序缺陷：那两版都要等 onResume 后
+        // 0/300/800ms 的延时任务，而延时期间 XHS 早已用 277 完成首帧绘制。
+        try {
+            Method attach = View.class.getDeclaredMethod("onAttachedToWindow");
+            hook(attach).intercept(chain -> {
+                Object r = chain.proceed();
+                try {
+                    Object thisObj = chain.getThisObject();
+                    if (thisObj instanceof View) {
+                        View v = (View) thisObj;
+                        String cn = v.getClass().getName();
+                        if (isTarget(cn)) {
+                            synchronized (hookedClasses) {
+                                if (!hookedClasses.contains(cn)) {
+                                    hookedClasses.add(cn);
+                                    hookPaddingSetters(v.getClass());
+                                }
+                            }
+                            clampPadding(v);
+                            ensureGuard(v);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                return r;
+            });
+            log(Log.INFO, TAG, "onAttachedToWindow hook installed");
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "hook onAttachedToWindow failed: " + t);
+        }
+
+        // ★ 测量阶段干预：直接把 MeasureSpec 的宽度改成 EXACTLY 满屏宽。
+        //
+        // 逐帧取证表明 XHS 把「左右留白」做成了子视图宽度（1672-90=1582），
+        // 这是在它自己的 measure 流程里算出来的；在 PreDraw（绘制前）改
+        // LayoutParams 已经太晚 —— 当帧仍按 1582 布局，下一帧又被它算回去。
+        // 因此在 onMeasure 入口就把宽度规格换成满宽，它的布局结果从一开始
+        // 就是满宽，不存在任何中间态。
+        try {
+            Method onMeasure = View.class.getDeclaredMethod(
+                    "onMeasure", int.class, int.class);
+            hook(onMeasure).intercept(chain -> {
+                try {
+                    Object self = chain.getThisObject();
+                    if (self instanceof View && isTarget(((View) self).getClass().getName())) {
+                        // 关键：在 measure 之前先把 padding 归一。
+                        // measure 早于 layout / draw，也早于任何帧被合成，
+                        // 因此「打开前就定好」在这里成立 —— 不存在中间态。
+                        clampPadding((View) self);
+
+                        List<Object> args = chain.getArgs();
+                        int wSpec = (Integer) args.get(0);
+                        int mode = View.MeasureSpec.getMode(wSpec);
+                        if (mode != View.MeasureSpec.UNSPECIFIED) {
+                            View v = (View) self;
+                            View parent = (View) v.getParent();
+                            int target = parent != null && parent.getWidth() > 0
+                                    ? parent.getWidth()
+                                    : v.getResources().getDisplayMetrics().widthPixels;
+                            args.set(0, View.MeasureSpec.makeMeasureSpec(
+                                    target, View.MeasureSpec.EXACTLY));
+                            return chain.proceedWith(args);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                return chain.proceed();
+            });
+            log(Log.INFO, TAG, "onMeasure hook installed (width forced + pad normalized)");
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "hook onMeasure failed: " + t);
+        }
+
+        // 判定 277 是否来自 XML 布局的初始值：在目标类的构造函数返回时
+        // 读一次 padding。构造完成即非 0，说明是布局初始值（Java 层改不到源头），
+        // 那就必须把「归位」提前到 attach 之前、甚至构造之后立即执行。
+        if (cl0 != null) {
+            for (String cn : TARGET_CLASSES) {
+                try {
+                    Class<?> c = Class.forName(cn, false, cl0);
+                    for (Constructor<?> ctor : c.getDeclaredConstructors()) {
+                        ctor.setAccessible(true);
+                        hook(ctor).intercept(chain -> {
+                            Object r = chain.proceed();
+                            try {
+                                if (r instanceof View) {
+                                    View v = (View) r;
+                                    int pl = v.getPaddingLeft();
+                                    XposedModule m = sModule;
+                                    if (m != null) {
+                                        m.log(Log.INFO, TAG, "CTOR " + cn
+                                                + " initialPad=" + pl);
+                                    }
+                                    if (pl != PAD_TARGET) {
+                                        v.setPadding(PAD_TARGET, v.getPaddingTop(),
+                                                PAD_TARGET, v.getPaddingBottom());
+                                    }
+                                    ensureGuard(v);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                            return r;
+                        });
+                    }
+                    log(Log.INFO, TAG, "hooked ctors: " + cn);
+                } catch (Throwable t) {
+                    log(Log.INFO, TAG, "ctor hook skipped " + cn + ": " + t);
+                }
+            }
         }
     }
 
@@ -163,6 +383,54 @@ public class MainHook extends XposedModule {
     }
 
     /**
+     * 需要「收窄内边距」的容器。
+     *
+     * 关键区分（实测宽度关系得出）：
+     *   NoteDetailContentView  w=1672  ← 满宽「外层容器」，它自己不该有内边距，
+     *                                     否则会把子视图挤窄 90px（45*2）
+     *   CommentListView        w=1582  ← 真正需要 45px 边距的内容区
+     *   AsyncImageInfoView     w=1582  ← 同上
+     * 早先对三者一律设 45，导致外层也吃 90px，总留白翻倍（180px），
+     * 内容反而更窄 —— 这是「看起来仍很窄」的直接原因。
+     */
+    private static boolean needsGutter(String cn) {
+        return (cn.contains("CommentListView") || cn.contains("AsyncImageInfoView"))
+                && !cn.contains("NoteDetailContentView");
+    }
+
+    /** 外层容器：必须保持 0 内边距，否则会挤压子视图。 */
+    private static boolean isOuterContainer(String cn) {
+        return cn.contains("NoteDetailContentView");
+    }
+
+    /**
+     * 遍历一棵子树，把命中目标类的节点边距归一到 PAD_TARGET。
+     * 用于在 XHS 自己的计算逻辑（wj9.c0.y0）返回后立刻修正结果，
+     * 此时尚未测量/布局/绘制，所以不会产生可见的中间态。
+     */
+    private static void normalizeTree(View root) {
+        normalizeNode(root, 0);
+    }
+
+    private static void normalizeNode(View v, int depth) {
+        if (v == null || depth > MAX_DEPTH) {
+            return;
+        }
+        try {
+            if (isTarget(v.getClass().getName())) {
+                clampPadding(v);
+            }
+            if (v instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) v;
+                for (int i = 0; i < vg.getChildCount(); i++) {
+                    normalizeNode(vg.getChildAt(i), depth + 1);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
      * Hook the REAL class's setPadding / setPaddingRelative. XHS overrides
      * setPadding on its comment/image containers, so hooking only View.setPadding
      * (the superclass declaration) would miss those calls. We hook the override
@@ -192,18 +460,88 @@ public class MainHook extends XposedModule {
     private XposedInterface.Hooker clampHookFor() {
         return chain -> {
             try {
+                Object thisObj = chain.getThisObject();
+                String cn = thisObj instanceof View
+                        ? thisObj.getClass().getName() : "";
                 List<Object> args = chain.getArgs();
                 int l = (Integer) args.get(0);
                 int r = (Integer) args.get(2);
-                if (l == r && l >= PAD_THRESHOLD) {
-                    args.set(0, PAD_TARGET);
-                    args.set(2, PAD_TARGET);
+                if (isTarget(cn) && l == r && l >= PAD_THRESHOLD) {
+                    // 内容区收成 45；外层容器清成 0（否则会挤压子视图 90px）
+                    int want = isOuterContainer(cn) ? 0 : PAD_TARGET;
+                    args.set(0, want);
+                    args.set(2, want);
                     return chain.proceedWith(args);
                 }
             } catch (Throwable ignored) {
             }
             return chain.proceed();
         };
+    }
+
+    /** 完整调用栈，用于定位真正的赋值入口（不做任何裁剪）。 */
+    private static String fullStack() {
+        try {
+            StackTraceElement[] st = new Throwable().getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            for (StackTraceElement e : st) {
+                sb.append("      ").append(e.getClassName()).append('.')
+                  .append(e.getMethodName()).append(':').append(e.getLineNumber()).append('\n');
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "      <stack failed>";
+        }
+    }
+
+    /** 只保留与小红书自身业务相关的调用帧，最多 8 层，避免日志刷屏。 */
+    private static String shortStack() {
+        try {
+            StackTraceElement[] st = new Throwable().getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            int n = 0;
+            for (StackTraceElement e : st) {
+                String c = e.getClassName();
+                // 跳过框架与自身
+                if (c.startsWith("android.") || c.startsWith("java.")
+                        || c.startsWith("com.android.") || c.startsWith("io.github.libxposed")
+                        || c.startsWith(MainHook.class.getName())
+                        || c.startsWith("LSPosed") || c.contains("XposedBridge")
+                        || c.contains("$Proxy") || c.contains("LSP"))
+                    continue;
+                sb.append("    ").append(c).append('.').append(e.getMethodName())
+                  .append(':').append(e.getLineNumber()).append('\n');
+                if (++n >= 8) break;
+            }
+            return sb.length() == 0 ? "    (no app frames)" : sb.toString();
+        } catch (Throwable t) {
+            return "    <stack failed>";
+        }
+    }
+
+    /**
+     * 探测某个类的方法签名，用于把混淆名映射到真实签名。
+     * 只打印名字里带 "y0"/"c0" 嫌疑的类，控制日志量。
+     */
+    private void probeClass(String className, ClassLoader cl) {
+        try {
+            Class<?> c = Class.forName(className, false, cl);
+            log(Log.INFO, TAG, "PROBE " + className + " methods:");
+            for (Method m : c.getDeclaredMethods()) {
+                StringBuilder sb = new StringBuilder();
+                sb.append("    ").append(m.getReturnType().getSimpleName())
+                  .append(' ').append(m.getName()).append('(');
+                Class<?>[] ps = m.getParameterTypes();
+                for (int i = 0; i < ps.length; i++) {
+                    if (i > 0) sb.append(", ");
+                    sb.append(ps[i].getSimpleName());
+                }
+                sb.append(')');
+                log(Log.INFO, TAG, sb.toString());
+            }
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "probe " + className + " failed: " + t);
+        }
     }
 
     private void scheduleFix(final Activity a) {
@@ -249,9 +587,6 @@ public class MainHook extends XposedModule {
         try {
             String cn = v.getClass().getName();
             if (isTarget(cn)) {
-                log(Log.INFO, TAG, "target hit: " + cn
-                        + " pad=" + v.getPaddingLeft() + "/" + v.getPaddingRight()
-                        + " w=" + v.getWidth());
                 // Hook the real class's setters so XHS's override (and async
                 // re-sets) are intercepted. Done once per class.
                 synchronized (hookedClasses) {
@@ -261,10 +596,11 @@ public class MainHook extends XposedModule {
                     }
                 }
                 clampPadding(v);
-                // Self-terminating guard: keeps clamping while XHS re-sets the
-                // padding after comments load, then removes itself so it stops
-                // driving layout once the value has settled.
-                attachLayoutGuard(v);
+                boolean fresh = v.getTag(TAG_GUARD) == null;
+                ensureGuard(v);
+                if (fresh) {
+                    log(Log.INFO, TAG, "guard on (fixView): " + cn);
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -277,61 +613,91 @@ public class MainHook extends XposedModule {
     }
 
     /**
-     * Idempotent clamp: writes only when the value actually needs changing, so
-     * a settled layout is never disturbed.
+     * 挂 PreDraw 守卫（幂等）。onAttachedToWindow 与 fixView 两条路径都会调，
+     * 用 View tag 去重，避免同一个 View 上堆多个监听器。
+     */
+    @SuppressWarnings("unchecked")
+    private static void ensureGuard(View v) {
+        try {
+            if (v.getTag(TAG_GUARD) != null) {
+                return;
+            }
+            v.setTag(TAG_GUARD, Boolean.TRUE);
+            attachLayoutGuard(v);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Idempotent clamp：内容区设 45px 边距，外层容器保持 0。
+     * 只在数值真的不对时写入，避免每帧触发重新布局。
      */
     private static void clampPadding(View v) {
         try {
+            String cn = v.getClass().getName();
+            int want = isOuterContainer(cn) ? 0
+                    : (needsGutter(cn) ? PAD_TARGET : v.getPaddingLeft());
             int l = v.getPaddingLeft();
             int r = v.getPaddingRight();
-            if (l == r && l >= PAD_THRESHOLD) {
-                v.setPadding(PAD_TARGET, v.getPaddingTop(), PAD_TARGET, v.getPaddingBottom());
+            if (l != want || r != want) {
+                v.setPadding(want, v.getPaddingTop(), want, v.getPaddingBottom());
             }
         } catch (Throwable ignored) {
         }
     }
 
     /**
-     * Re-clamp on layout passes caused by XHS's own async padding re-set, and
-     * detach once the padding has stayed correct for a while. v1 kept the
-     * listener alive forever, so every layout pass wrote padding again.
+     * 每帧绘制前把目标容器「拉满宽度」并设定固定内边距。
+     *
+     * 为什么改宽度而不是只改 padding（逐帧取证后的结论）：
+     *   NoteDetailContentView  pad=45  w=1672   ← 满宽容器
+     *   CommentListView        pad=45  w=1582   ← 子视图比满宽少 90px
+     *   AsyncImageInfoView     pad=45  w=1582
+     * 小红书把「左右留白」做成了子视图宽度（1672-90=1582），而 padding 是
+     * 额外一层内边距。只改 padding 会与它的宽度计算叠加，总留白变成
+     * 90+90=180px，看上去依然偏窄、且首帧数值仍在 277/45 之间跳。
+     *
+     * 这里直接把宽度钉成 MATCH_PARENT：容器满宽 + 固定 45px 内边距
+     * = 内容区 1582px，左右各 45px，正是期望效果，且不再随它的计算漂移。
+     * 归一化只在数值真的不对时写入，避免每帧触发重新布局。
      */
     private static void attachLayoutGuard(final View v) {
         try {
-            final int[] settled = {0};
-            final ViewTreeObserver.OnGlobalLayoutListener[] holder = new ViewTreeObserver.OnGlobalLayoutListener[1];
-            ViewTreeObserver.OnGlobalLayoutListener l = new ViewTreeObserver.OnGlobalLayoutListener() {
-                private boolean busy = false;
+            final ViewTreeObserver.OnPreDrawListener l = new ViewTreeObserver.OnPreDrawListener() {
+                private int frame = 0;
 
                 @Override
-                public void onGlobalLayout() {
-                    if (busy) {
-                        return;
-                    }
-                    busy = true;
+                public boolean onPreDraw() {
                     try {
+                        String cn = v.getClass().getName();
                         int cur = v.getPaddingLeft();
-                        if (cur == v.getPaddingRight() && cur >= PAD_THRESHOLD) {
-                            v.setPadding(PAD_TARGET, v.getPaddingTop(),
-                                    PAD_TARGET, v.getPaddingBottom());
-                            settled[0] = 0;
-                        } else if (cur == PAD_TARGET) {
-                            // Correct and stable: stop listening after a few
-                            // consecutive clean passes.
-                            if (++settled[0] >= 3) {
-                                try {
-                                    v.getViewTreeObserver().removeOnGlobalLayoutListener(holder[0]);
-                                } catch (Throwable ignored) {
-                                }
+                        // 目标：内容区 45px；外层容器保持 0，否则会挤压子视图
+                        int want = isOuterContainer(cn) ? 0
+                                : (needsGutter(cn) ? PAD_TARGET : cur);
+                        boolean changed = false;
+                        if (cur != want) {
+                            v.setPadding(want, v.getPaddingTop(),
+                                    want, v.getPaddingBottom());
+                            changed = true;
+                        }
+
+                        if (VERBOSE && frame < 20) {
+                            XposedModule m = sModule;
+                            if (m != null) {
+                                m.log(Log.INFO, TAG, "FRAME " + frame + " "
+                                        + v.getClass().getSimpleName()
+                                        + " pad=" + cur + "->" + want
+                                        + " w=" + v.getWidth()
+                                        + (changed ? " [fixed]" : ""));
                             }
+                            frame++;
                         }
                     } catch (Throwable ignored) {
                     }
-                    busy = false;
+                    return true; // 不取消绘制
                 }
             };
-            holder[0] = l;
-            v.getViewTreeObserver().addOnGlobalLayoutListener(l);
+            v.getViewTreeObserver().addOnPreDrawListener(l);
         } catch (Throwable ignored) {
         }
     }

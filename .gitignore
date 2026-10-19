@@ -9,3 +9,8 @@ captures/
 *.jks
 # 例外：固定 debug 签名，用于 CI 产物可覆盖安装（公开的调试密钥，非生产密钥）
 !debug.keystore
+
+# 本地构建产物与工具（dexswap 方案）
+build_local/
+base/*.apk
+app/libs/*.jar
