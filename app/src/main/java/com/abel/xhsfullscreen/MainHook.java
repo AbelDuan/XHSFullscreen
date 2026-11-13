@@ -693,30 +693,86 @@ public class MainHook extends XposedModule {
     /** 上次读到档位时所处的屏幕；-1 表示尚未读过。 */
     private static volatile int sCachedTag = -1;
 
-    /** 内/外屏短边的分界值。本机外屏 1168、内屏 1672，取中点。换机型只改这一个数。 */
-    private static final int DIVIDER = (1168 + 1672) / 2;
+    /** 内/外屏短边的分界值（最窄与最宽屏的中点）；0 表示尚未算出。 */
+    private static volatile int sDivider = 0;
+
+    /**
+     * 用两块内置屏的真实短边算出分界值：最窄的是外屏、最宽的是内屏，取两者中点。
+     * 不写死任何尺寸，换机型或改分辨率都自动适应。
+     *
+     * Context 取自 q3e.h 单例的 e 字段 —— 模块启动时还没有 Activity，
+     * 但小红书的存储封装类自己就持有 Application Context。
+     *
+     * @return 分界值；拿不到两块屏时返回 0
+     */
+    private static int divider(ClassLoader cl) {
+        int cached = sDivider;
+        if (cached > 0) {
+            return cached;
+        }
+        try {
+            Class<?> h = Class.forName("q3e.h", false, cl);
+            Object inst = h.getMethod("g").invoke(null);
+            java.lang.reflect.Field fc = h.getDeclaredField("e");
+            fc.setAccessible(true);
+            android.content.Context ctx = (android.content.Context) fc.get(inst);
+
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager)
+                            ctx.getSystemService(android.content.Context.DISPLAY_SERVICE);
+            int lo = Integer.MAX_VALUE;
+            int hi = 0;
+            // getDisplays() 只返回当前可见的屏（折叠屏上通常只有 1 块），
+            // 必须用 ALL_INCLUDING_DISABLED 才能同时看到内屏和外屏。
+            android.view.Display[] all =
+                    // 该常量是 @hide，公开 SDK 里没有，直接用它的字符串值。
+                    dm.getDisplays("android.hardware.display.category.ALL_INCLUDING_DISABLED");
+            for (android.view.Display d : all) {
+                android.util.DisplayMetrics m = new android.util.DisplayMetrics();
+                d.getRealMetrics(m);
+                int shortSide = Math.min(m.widthPixels, m.heightPixels);
+                lo = Math.min(lo, shortSide);
+                hi = Math.max(hi, shortSide);
+            }
+            if (lo >= hi) {
+                return 0;   // 只有一块屏，无从比较
+            }
+            sDivider = lo + (hi - lo) / 2;
+            XposedModule mod = sModule;
+            if (mod != null) {
+                mod.log(Log.INFO, TAG, "divider=" + sDivider + " (" + lo + "~" + hi + ")");
+            }
+            return sDivider;
+        } catch (Throwable t) {
+            XposedModule mod = sModule;
+            if (mod != null) mod.log(Log.ERROR, TAG, "divider failed: " + t);
+            return 0;
+        }
+    }
 
     /**
      * 判定当前处于内屏还是外屏。
      *
      * 不能用 sw/dp：DPI 压到 350 后外屏 sw=534dp、内屏 sw=764dp，两屏都跨过 600dp，
      * 小红书因此判成同一块 —— 这才是「内外屏排版被拉平」的根源。
-     * 改用屏幕短边像素，与 DPI 取值无关。
+     * 改用屏幕短边像素与真实分界值比较，与 DPI 取值无关。
      *
      * @return 1 = 内屏，0 = 外屏
      */
-    private static int screenTag() {
+    private static int screenTag(ClassLoader cl) {
         android.util.DisplayMetrics dm =
                 android.content.res.Resources.getSystem().getDisplayMetrics();
-        return Math.min(dm.widthPixels, dm.heightPixels) >= DIVIDER ? 1 : 0;
+        int shortSide = Math.min(dm.widthPixels, dm.heightPixels);
+        int divider = divider(cl);
+        return divider > 0 && shortSide >= divider ? 1 : 0;
     }
 
     /** 小红书原始的档位 key → 按屏区分后的 key。其它 key 原样返回。 */
-    private static String taggedKey(String key) {
+    private static String taggedKey(String key, ClassLoader cl) {
         if (!SP_KEY.equals(key)) {
             return key;
         }
-        return SP_KEY + (screenTag() == 1 ? "_inner" : "_outer");
+        return SP_KEY + (screenTag(cl) == 1 ? "_inner" : "_outer");
     }
 
     /**
@@ -737,7 +793,7 @@ public class MainHook extends XposedModule {
                 j.setAccessible(true);
                 hook(j).intercept(chain -> {
                     List<Object> orig = chain.getArgs();
-                    String nk = taggedKey((String) orig.get(0));
+                    String nk = taggedKey((String) orig.get(0), cl);
                     if (nk.equals(orig.get(0)) || Boolean.TRUE.equals(sInSpHook.get())) {
                         return chain.proceed();
                     }
@@ -759,7 +815,7 @@ public class MainHook extends XposedModule {
                 u.setAccessible(true);
                 hook(u).intercept(chain -> {
                     List<Object> orig = chain.getArgs();
-                    String nk = taggedKey((String) orig.get(0));
+                    String nk = taggedKey((String) orig.get(0), cl);
                     if (nk.equals(orig.get(0)) || Boolean.TRUE.equals(sInSpHook.get())) {
                         return chain.proceed();
                     }
@@ -786,7 +842,7 @@ public class MainHook extends XposedModule {
                 Method a = msn.getDeclaredMethod("a");
                 a.setAccessible(true);
                 hook(a).intercept(chain -> {
-                    int tag = screenTag();
+                    int tag = screenTag(cl);
                     if (tag != sCachedTag) {
                         sCachedTag = tag;
                         int v = readScaleForScreen(cl);
@@ -821,7 +877,7 @@ public class MainHook extends XposedModule {
             Method j = h.getDeclaredMethod("j", String.class, int.class);
             j.setAccessible(true);
             Object normal = Class.forName("ms.n$c", false, cl).getField("NORMAL").get(null);
-            Object v = j.invoke(inst, taggedKey(SP_KEY), ((Enum<?>) normal).ordinal());
+            Object v = j.invoke(inst, taggedKey(SP_KEY, cl), ((Enum<?>) normal).ordinal());
             return ((Integer) v).intValue();
         } catch (Throwable t) {
             XposedModule m = sModule;
