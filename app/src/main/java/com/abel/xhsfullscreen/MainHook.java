@@ -101,7 +101,6 @@ public class MainHook extends XposedModule {
     // PreDraw 守卫连续观察到的稳定帧数；达到后自行摘除监听。
     // 稳定后每帧的回调只剩开销没有收益，摘掉可省掉持续的对象分配与检查。
     // 取 30 帧（约 0.25~0.5 秒），足够覆盖小红书异步重设边距的窗口。
-    private static final int GUARD_STABLE_FRAMES = 30;
 
     // Real (possibly overridden) classes whose setPadding we have already
     // hooked. Keyed by class name; bounded and never reset.
@@ -407,12 +406,20 @@ public class MainHook extends XposedModule {
                 List<Object> args = chain.getArgs();
                 int l = (Integer) args.get(0);
                 int r = (Integer) args.get(2);
-                if (isTarget(cn) && l == r && l >= PAD_THRESHOLD) {
-                    // 内容区收成 45；外层容器清成 0（否则会挤压子视图 90px）
+                if (isTarget(cn)) {
+                    // 内容区收成 45；外层容器清成 0（否则会挤压子视图 90px）。
+                    // 不再要求 l == r 且 >= PAD_THRESHOLD —— 小红书偶尔会写
+                    // 不对称值或小于阈值的值，旧条件放行后边距就再也拉不回来，
+                    // 表现为「偶发某条帖子的评论区宽度不对」。
                     int want = isOuterContainer(cn) ? 0 : PAD_TARGET;
-                    args.set(0, want);
-                    args.set(2, want);
-                    return chain.proceedWith(args);
+                    if (l != want || r != want) {
+                        // 复制后改写：chain.getArgs() 不保证可变，
+                        // 原地 set 在个别通道会抛 UnsupportedOperationException。
+                        List<Object> patched = new java.util.ArrayList<>(args);
+                        patched.set(0, want);
+                        patched.set(2, want);
+                        return chain.proceedWith(patched);
+                    }
                 }
             } catch (Throwable ignored) {
             }
@@ -614,27 +621,20 @@ public class MainHook extends XposedModule {
             final ViewTreeObserver.OnPreDrawListener l =
                     new ViewTreeObserver.OnPreDrawListener() {
                 private int frame = 0;
-                private int stable = 0;
 
                 @Override
                 public boolean onPreDraw() {
                     try {
                         // want < 0 表示这既不是外层也不是内容区，无需干预
+                        // 守卫常驻：只做一次整数比较，开销可忽略。
+                        // 早先在稳定 30 帧后自行摘除，之后小红书再异步改一次
+                        // 内边距就无人纠正 —— 评论区是异步加载的，触发时机随机，
+                        // 这正是「偶发某条帖子宽度不对、重进又正常」的原因。
                         if (want >= 0) {
-                            int cur = v.getPaddingLeft();
-                            if (cur != want || v.getPaddingRight() != want) {
+                            if (v.getPaddingLeft() != want || v.getPaddingRight() != want) {
                                 v.setPadding(want, v.getPaddingTop(),
                                         want, v.getPaddingBottom());
-                                stable = 0;
-                            } else if (++stable >= GUARD_STABLE_FRAMES) {
-                                // 稳定后自行摘除：此后不再每帧回调，
-                                // 避免持续的对象分配与检查开销。
-                                v.getViewTreeObserver().removeOnPreDrawListener(this);
-                                v.setTag(TAG_GUARD, null);
                             }
-                        } else {
-                            v.getViewTreeObserver().removeOnPreDrawListener(this);
-                            v.setTag(TAG_GUARD, null);
                         }
 
                         if (VERBOSE && frame < 20) {
