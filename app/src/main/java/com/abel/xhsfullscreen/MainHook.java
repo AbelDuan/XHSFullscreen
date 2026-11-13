@@ -690,104 +690,28 @@ public class MainHook extends XposedModule {
     private static final ThreadLocal<Boolean> sInSpHook =
             ThreadLocal.withInitial(() -> Boolean.FALSE);
 
-    /** 内/外屏短边的分界值；<=0 表示尚未算出，screenTag() 会用本机实测常量兜底。 */
-    private static volatile int sDivider = 0;
+    /** 上次读到档位时所处的屏幕；-1 表示尚未读过。 */
+    private static volatile int sCachedTag = -1;
 
-    /**
-     * 从 DisplayManager 枚举所有屏幕，取短边最小与最大者的中点作为内外屏分界，
-     * 这样换机型不必改常量。折叠屏上通常只能看到当前那一块屏，枚举不到第二块时
-     * 直接返回，由 screenTag() 的实测常量兜底，功能不受影响。
-     */
-    private static void computeDivider(android.content.Context ctx) {
-        try {
-            if (sDivider > 0) {
-                return;
-            }
-            if (ctx == null) {
-                ctx = currentApplication();
-            }
-            if (ctx == null) {
-                return;
-            }
-            android.hardware.display.DisplayManager dm =
-                    (android.hardware.display.DisplayManager) ctx.getSystemService(
-                            android.content.Context.DISPLAY_SERVICE);
-            if (dm == null) {
-                return;
-            }
-            java.util.TreeSet<Integer> sizes = new java.util.TreeSet<>();
-            for (android.view.Display d : dm.getDisplays()) {
-                if (d == null) {
-                    continue;
-                }
-                android.util.DisplayMetrics m = new android.util.DisplayMetrics();
-                d.getMetrics(m);
-                int shortSide = Math.min(m.widthPixels, m.heightPixels);
-                if (shortSide > 0) {
-                    sizes.add(shortSide);
-                }
-            }
-            if (sizes.size() >= 2) {
-                int lo = sizes.first();
-                int hi = sizes.last();
-                if (hi > lo) {
-                    sDivider = lo + (hi - lo) / 2;
-                    XposedModule m = sModule;
-                    if (m != null) {
-                        m.log(Log.INFO, TAG, "screen divider = " + sDivider
-                                + " (short sides " + sizes + ")");
-                    }
-                }
-            }
-        } catch (Throwable t) {
-            XposedModule m = sModule;
-            if (m != null) {
-                m.log(Log.WARN, TAG, "computeDivider failed, using default: " + t);
-            }
-        }
-    }
-
-    /** 取宿主应用 Context（模块在 onPackageLoaded 阶段运行，还没有 Activity）。 */
-    private static android.content.Context currentApplication() {
-        try {
-            Class<?> at = Class.forName("android.app.ActivityThread");
-            java.lang.reflect.Method m = at.getDeclaredMethod("currentApplication");
-            m.setAccessible(true);
-            Object app = m.invoke(null);
-            if (app instanceof android.content.Context) {
-                return (android.content.Context) app;
-            }
-        } catch (Throwable ignored) {
-        }
-        return null;
-    }
+    /** 内/外屏短边的分界值。本机外屏 1168、内屏 1672，取中点。换机型只改这一个数。 */
+    private static final int DIVIDER = (1168 + 1672) / 2;
 
     /**
      * 判定当前处于内屏还是外屏。
      *
-     * 不能用 sw/dp 判定：DPI 被压到 350 后，外屏 sw=534dp、内屏 sw=764dp，
-     * 两块屏都跨过了 600dp 这条「平板布局」分界线，小红书因此把两者判成同一块 ——
-     * 这正是「内外屏排版被拉平」的根源。改用屏幕短边像素判定，与 DPI 取值无关。
+     * 不能用 sw/dp：DPI 压到 350 后外屏 sw=534dp、内屏 sw=764dp，两屏都跨过 600dp，
+     * 小红书因此判成同一块 —— 这才是「内外屏排版被拉平」的根源。
+     * 改用屏幕短边像素，与 DPI 取值无关。
      *
      * @return 1 = 内屏，0 = 外屏
      */
     private static int screenTag() {
-        try {
-            android.util.DisplayMetrics dm =
-                    android.content.res.Resources.getSystem().getDisplayMetrics();
-            int shortSide = Math.min(dm.widthPixels, dm.heightPixels);
-
-            int divider = sDivider;
-            if (divider > 0) {
-                return shortSide >= divider ? 1 : 0;   // 1=内屏, 0=外屏
-            }
-            // 还没算出分界值时，退回本机实测的两块屏短边（外屏 1168 / 内屏 1672）的中点。
-            return shortSide >= (1168 + 1672) / 2 ? 1 : 0;
-        } catch (Throwable t) {
-            return 0;
-        }
+        android.util.DisplayMetrics dm =
+                android.content.res.Resources.getSystem().getDisplayMetrics();
+        return Math.min(dm.widthPixels, dm.heightPixels) >= DIVIDER ? 1 : 0;
     }
 
+    /** 小红书原始的档位 key → 按屏区分后的 key。其它 key 原样返回。 */
     private static String taggedKey(String key) {
         if (!SP_KEY.equals(key)) {
             return key;
@@ -795,7 +719,14 @@ public class MainHook extends XposedModule {
         return SP_KEY + (screenTag() == 1 ? "_inner" : "_outer");
     }
 
-    /** h.j(String,int)I 读取 / h.u(String,int)V 写入 —— 都走这里按屏换 key。 */
+    /**
+     * h.j(String,int)I 读取 / h.u(String,int)V 写入 —— 都走这里按屏换 key。
+     *
+     * 两处都不能用 chain.proceedWith()：它要求 thisObject 精确等于声明类 q3e.h，
+     * 而实际实例是 MMKV 包装的子类，会抛 IllegalArgumentException
+     * → 连带 ms.n.<clinit> 失败 → 小红书启动即闪退。
+     * 因此改在同一个实例上用反射重放。
+     */
     private void installSplitScreenScale(ClassLoader cl) {
         try {
             Class<?> h = Class.forName("q3e.h", false, cl);
@@ -806,23 +737,16 @@ public class MainHook extends XposedModule {
                 j.setAccessible(true);
                 hook(j).intercept(chain -> {
                     List<Object> orig = chain.getArgs();
-                    String key = (String) orig.get(0);
-                    String nk = taggedKey(key);
-                    if (nk.equals(key) || Boolean.TRUE.equals(sInSpHook.get())) {
+                    String nk = taggedKey((String) orig.get(0));
+                    if (nk.equals(orig.get(0)) || Boolean.TRUE.equals(sInSpHook.get())) {
                         return chain.proceed();
                     }
-                    // ⚠ 不能用 proceedWith：它要求 thisObject 精确等于声明类
-                    //   q3e.h，而实际实例是子类，会抛 IllegalArgumentException
-                    //   → 连带 ms.n.<clinit> 失败 → 小红书闪退。
-                    //   改为在同一个实例上直接反射调用，绕过类型校验。
                     sInSpHook.set(Boolean.TRUE);
-                    Object r;
                     try {
-                        r = j.invoke(chain.getThisObject(), nk, orig.get(1));
+                        return j.invoke(chain.getThisObject(), nk, orig.get(1));
                     } finally {
                         sInSpHook.set(Boolean.FALSE);
                     }
-                    return r;
                 });
                 log(Log.INFO, TAG, "hooked SP read j(String,int)");
             } catch (Throwable t) {
@@ -835,20 +759,15 @@ public class MainHook extends XposedModule {
                 u.setAccessible(true);
                 hook(u).intercept(chain -> {
                     List<Object> orig = chain.getArgs();
-                    String key = (String) orig.get(0);
-                    String nk = taggedKey(key);
-                    if (nk.equals(key) || Boolean.TRUE.equals(sInSpHook.get())) {
+                    String nk = taggedKey((String) orig.get(0));
+                    if (nk.equals(orig.get(0)) || Boolean.TRUE.equals(sInSpHook.get())) {
                         return chain.proceed();
                     }
-                    // 同上：用反射在原实例上调用，避免 proceedWith 的类型校验。
                     sInSpHook.set(Boolean.TRUE);
                     try {
                         u.invoke(chain.getThisObject(), nk, orig.get(1));
                     } finally {
                         sInSpHook.set(Boolean.FALSE);
-                    }
-                    if (VERBOSE) {
-                        log(Log.INFO, TAG, "SP write " + nk + " = " + orig.get(1));
                     }
                     return null;
                 });
@@ -858,9 +777,8 @@ public class MainHook extends XposedModule {
             }
 
             // 静态字段 ms.n.d 只在 <clinit> 读一次并缓存，切屏不会重读。
-            // 这里 hook a()：每次取档位时若发现"当前屏"与"缓存所属屏"不一致，
-            // 就按当前屏重新从 SP 读一次写回 d —— 走的是它自己的存储路径，
-            // 没有额外状态，也不会和 m() 的写入打架。
+            // 这里 hook a()：发现「当前屏」与「缓存所属屏」不一致，就按当前屏
+            // 重新从 SP 读一次写回 d —— 走它自己的存储路径，没有额外状态。
             try {
                 final Class<?> msn = Class.forName("ms.n", false, cl);
                 final java.lang.reflect.Field fd = msn.getDeclaredField("d");
@@ -868,14 +786,9 @@ public class MainHook extends XposedModule {
                 Method a = msn.getDeclaredMethod("a");
                 a.setAccessible(true);
                 hook(a).intercept(chain -> {
-                    // a() 首次被调用时 App 已完全启动，此时算内外屏分界值最稳。
-                    if (sDivider <= 0) {
-                        computeDivider(currentApplication());
-                    }
                     int tag = screenTag();
                     if (tag != sCachedTag) {
                         sCachedTag = tag;
-                        // 按当前屏重新读：h.j("screen_scale_sp_key_xxx", NORMAL)
                         int v = readScaleForScreen(cl);
                         try {
                             fd.setInt(null, v);
@@ -895,14 +808,11 @@ public class MainHook extends XposedModule {
         }
     }
 
-
-    /** 上次读到档位时所处的屏幕；-1 表示尚未读过。 */
-    private static volatile int sCachedTag = -1;
-
     /**
-     * 按当前屏从 SP 读出档位。默认值沿用小红书自己的约定：
-     * ms.n$c.NORMAL.ordinal()，即 0。这里不写死 0，而是直接取枚举值，
-     * 免得将来枚举顺序变化时取到错误的档位。
+     * 按当前屏从 SP 读档位。
+     *
+     * 默认值取 ms.n$c.NORMAL，实测 ordinal = 1（ZOOM_IN=0, NORMAL=1, ZOOM_OUT=2）。
+     * 运行时读枚举而不写死，免得小红书调整枚举顺序后取错档位。
      */
     private static int readScaleForScreen(ClassLoader cl) {
         try {
@@ -910,15 +820,8 @@ public class MainHook extends XposedModule {
             Object inst = h.getMethod("g").invoke(null);
             Method j = h.getDeclaredMethod("j", String.class, int.class);
             j.setAccessible(true);
-            int def = 0;
-            try {
-                Class<?> c = Class.forName("ms.n$c", false, cl);
-                Object normal = c.getField("NORMAL").get(null);
-                def = ((Enum<?>) normal).ordinal();
-            } catch (Throwable ignored) {
-            }
-            String key = SP_KEY + (screenTag() == 1 ? "_inner" : "_outer");
-            Object v = j.invoke(inst, key, def);
+            Object normal = Class.forName("ms.n$c", false, cl).getField("NORMAL").get(null);
+            Object v = j.invoke(inst, taggedKey(SP_KEY), ((Enum<?>) normal).ordinal());
             return ((Integer) v).intValue();
         } catch (Throwable t) {
             XposedModule m = sModule;
@@ -926,5 +829,4 @@ public class MainHook extends XposedModule {
             return 0;
         }
     }
-
 }
