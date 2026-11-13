@@ -61,6 +61,28 @@ import io.github.libxposed.api.XposedModuleInterface;
  *   - The global-layout listener removes itself once the clamp has settled.
  *   - The ImageView/timer-driven depth walk and the maxWidth reflection are
  *     removed entirely.
+ *
+ * ---------------------------------------------------------------------------
+ * v4 — 内外屏「信息流排数档位」独立记忆
+ * ---------------------------------------------------------------------------
+ * 小红书的手势缩放档位只存在一个 key 里：
+ *     "screen_scale_sp_key" -> ms.n$c { ZOOM_IN=0, NORMAL=1, ZOOM_OUT=2 }
+ * 且只在静态字段 ms.n.d 缓存一次：
+ *     <clinit> : d = h.j("screen_scale_sp_key", NORMAL)
+ *     a()      : return d
+ *     m(i, f)  : d = g(i, f); h.u("screen_scale_sp_key", d)
+ * 档位本身不分屏，所以内屏调好的排数会被带到外屏。
+ *
+ * 本模块不改动它的档位体系（枚举、DynamicColumnFitWidth 算法、列数计算全部原样），
+ * 只在落盘这一步按屏区分 key：screen_scale_sp_key_inner / _outer，
+ * 并在取档位时（a()）发现屏幕变了就按当前屏重读一次写回 d。
+ *
+ * 两个必须同时满足的实现细节（都是实测踩出来的坑）：
+ *   1. chain.getArgs() 返回不可变列表，不能原地 set()，否则抛
+ *      UnsupportedOperationException —— key 换不掉，且每次调用都刷异常。
+ *   2. 不能用 chain.proceedWith()：它要求 thisObject 精确等于声明类 q3e.h，
+ *      而实际实例是 MMKV 包装的子类，会抛 IllegalArgumentException，
+ *      连带 ms.n.<clinit> 失败 → 小红书启动即闪退。改为反射在原实例上调用。
  */
 
 public class MainHook extends XposedModule {
@@ -184,6 +206,22 @@ public class MainHook extends XposedModule {
             } catch (Throwable t) {
                 log(Log.ERROR, TAG, "hook wj9.c0.y0 failed: " + t);
             }
+        }
+
+        // ================= 内外屏档位独立记忆（v4） =================
+        //
+        // 原理（来自 dexdump 取证，classes18.dex）：
+        //   小红书的信息流"排数档位"存在 SharedPreferences 里，key 固定为
+        //   "screen_scale_sp_key"，值取自枚举 ms.n$c {NORMAL, ZOOM_IN, ZOOM_OUT}，
+        //   并被写入静态字段 ms.n.d。
+        //     <clinit> : d = h.j("screen_scale_sp_key", NORMAL.ordinal())
+        //     m(IF)I   : d = g(i,f); h.u("screen_scale_sp_key", d)
+        //   两处都用同一个 key、同一个静态字段 —— 所以内屏设的档位会带到外屏。
+        //
+        // 修法：只在"落盘"这一步按屏区分。读/写 key 时根据当前屏幕追加后缀，
+        // 档位体系本身（枚举、算法 DynamicColumnFitWidth、列数计算）完全不动。
+        if (cl0 != null) {
+            installSplitScreenScale(cl0);
         }
 
         // 注：曾在这里 hook NestedScrollLayout 的滚动偏移 B，想消除「打开时
@@ -643,4 +681,250 @@ public class MainHook extends XposedModule {
         } catch (Throwable ignored) {
         }
     }
+
+    // ==================== 内外屏档位独立记忆 ====================
+
+    private static final String SP_KEY = "screen_scale_sp_key";
+
+    /** 内部改写 key 后自我调用时的递归保护，防止 hook 重入死循环。 */
+    private static final ThreadLocal<Boolean> sInSpHook =
+            ThreadLocal.withInitial(() -> Boolean.FALSE);
+
+    /** 内/外屏短边的分界值；<=0 表示尚未算出，screenTag() 会用本机实测常量兜底。 */
+    private static volatile int sDivider = 0;
+
+    /**
+     * 从 DisplayManager 枚举所有屏幕，取短边最小与最大者的中点作为内外屏分界，
+     * 这样换机型不必改常量。折叠屏上通常只能看到当前那一块屏，枚举不到第二块时
+     * 直接返回，由 screenTag() 的实测常量兜底，功能不受影响。
+     */
+    private static void computeDivider(android.content.Context ctx) {
+        try {
+            if (sDivider > 0) {
+                return;
+            }
+            if (ctx == null) {
+                ctx = currentApplication();
+            }
+            if (ctx == null) {
+                return;
+            }
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager) ctx.getSystemService(
+                            android.content.Context.DISPLAY_SERVICE);
+            if (dm == null) {
+                return;
+            }
+            java.util.TreeSet<Integer> sizes = new java.util.TreeSet<>();
+            for (android.view.Display d : dm.getDisplays()) {
+                if (d == null) {
+                    continue;
+                }
+                android.util.DisplayMetrics m = new android.util.DisplayMetrics();
+                d.getMetrics(m);
+                int shortSide = Math.min(m.widthPixels, m.heightPixels);
+                if (shortSide > 0) {
+                    sizes.add(shortSide);
+                }
+            }
+            if (sizes.size() >= 2) {
+                int lo = sizes.first();
+                int hi = sizes.last();
+                if (hi > lo) {
+                    sDivider = lo + (hi - lo) / 2;
+                    XposedModule m = sModule;
+                    if (m != null) {
+                        m.log(Log.INFO, TAG, "screen divider = " + sDivider
+                                + " (short sides " + sizes + ")");
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            XposedModule m = sModule;
+            if (m != null) {
+                m.log(Log.WARN, TAG, "computeDivider failed, using default: " + t);
+            }
+        }
+    }
+
+    /** 取宿主应用 Context（模块在 onPackageLoaded 阶段运行，还没有 Activity）。 */
+    private static android.content.Context currentApplication() {
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method m = at.getDeclaredMethod("currentApplication");
+            m.setAccessible(true);
+            Object app = m.invoke(null);
+            if (app instanceof android.content.Context) {
+                return (android.content.Context) app;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /**
+     * 判定当前处于内屏还是外屏。
+     *
+     * 不能用 sw/dp 判定：DPI 被压到 350 后，外屏 sw=534dp、内屏 sw=764dp，
+     * 两块屏都跨过了 600dp 这条「平板布局」分界线，小红书因此把两者判成同一块 ——
+     * 这正是「内外屏排版被拉平」的根源。改用屏幕短边像素判定，与 DPI 取值无关。
+     *
+     * @return 1 = 内屏，0 = 外屏
+     */
+    private static int screenTag() {
+        try {
+            android.util.DisplayMetrics dm =
+                    android.content.res.Resources.getSystem().getDisplayMetrics();
+            int shortSide = Math.min(dm.widthPixels, dm.heightPixels);
+
+            int divider = sDivider;
+            if (divider > 0) {
+                return shortSide >= divider ? 1 : 0;   // 1=内屏, 0=外屏
+            }
+            // 还没算出分界值时，退回本机实测的两块屏短边（外屏 1168 / 内屏 1672）的中点。
+            return shortSide >= (1168 + 1672) / 2 ? 1 : 0;
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    private static String taggedKey(String key) {
+        if (!SP_KEY.equals(key)) {
+            return key;
+        }
+        return SP_KEY + (screenTag() == 1 ? "_inner" : "_outer");
+    }
+
+    /** h.j(String,int)I 读取 / h.u(String,int)V 写入 —— 都走这里按屏换 key。 */
+    private void installSplitScreenScale(ClassLoader cl) {
+        try {
+            Class<?> h = Class.forName("q3e.h", false, cl);
+
+            // 读取：j(String, int) -> int
+            try {
+                Method j = h.getDeclaredMethod("j", String.class, int.class);
+                j.setAccessible(true);
+                hook(j).intercept(chain -> {
+                    List<Object> orig = chain.getArgs();
+                    String key = (String) orig.get(0);
+                    String nk = taggedKey(key);
+                    if (nk.equals(key) || Boolean.TRUE.equals(sInSpHook.get())) {
+                        return chain.proceed();
+                    }
+                    // ⚠ 不能用 proceedWith：它要求 thisObject 精确等于声明类
+                    //   q3e.h，而实际实例是子类，会抛 IllegalArgumentException
+                    //   → 连带 ms.n.<clinit> 失败 → 小红书闪退。
+                    //   改为在同一个实例上直接反射调用，绕过类型校验。
+                    sInSpHook.set(Boolean.TRUE);
+                    Object r;
+                    try {
+                        r = j.invoke(chain.getThisObject(), nk, orig.get(1));
+                    } finally {
+                        sInSpHook.set(Boolean.FALSE);
+                    }
+                    return r;
+                });
+                log(Log.INFO, TAG, "hooked SP read j(String,int)");
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG, "hook SP read failed: " + t);
+            }
+
+            // 写入：u(String, int) -> void
+            try {
+                Method u = h.getDeclaredMethod("u", String.class, int.class);
+                u.setAccessible(true);
+                hook(u).intercept(chain -> {
+                    List<Object> orig = chain.getArgs();
+                    String key = (String) orig.get(0);
+                    String nk = taggedKey(key);
+                    if (nk.equals(key) || Boolean.TRUE.equals(sInSpHook.get())) {
+                        return chain.proceed();
+                    }
+                    // 同上：用反射在原实例上调用，避免 proceedWith 的类型校验。
+                    sInSpHook.set(Boolean.TRUE);
+                    try {
+                        u.invoke(chain.getThisObject(), nk, orig.get(1));
+                    } finally {
+                        sInSpHook.set(Boolean.FALSE);
+                    }
+                    if (VERBOSE) {
+                        log(Log.INFO, TAG, "SP write " + nk + " = " + orig.get(1));
+                    }
+                    return null;
+                });
+                log(Log.INFO, TAG, "hooked SP write u(String,int)");
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG, "hook SP write failed: " + t);
+            }
+
+            // 静态字段 ms.n.d 只在 <clinit> 读一次并缓存，切屏不会重读。
+            // 这里 hook a()：每次取档位时若发现"当前屏"与"缓存所属屏"不一致，
+            // 就按当前屏重新从 SP 读一次写回 d —— 走的是它自己的存储路径，
+            // 没有额外状态，也不会和 m() 的写入打架。
+            try {
+                final Class<?> msn = Class.forName("ms.n", false, cl);
+                final java.lang.reflect.Field fd = msn.getDeclaredField("d");
+                fd.setAccessible(true);
+                Method a = msn.getDeclaredMethod("a");
+                a.setAccessible(true);
+                hook(a).intercept(chain -> {
+                    // a() 首次被调用时 App 已完全启动，此时算内外屏分界值最稳。
+                    if (sDivider <= 0) {
+                        computeDivider(currentApplication());
+                    }
+                    int tag = screenTag();
+                    if (tag != sCachedTag) {
+                        sCachedTag = tag;
+                        // 按当前屏重新读：h.j("screen_scale_sp_key_xxx", NORMAL)
+                        int v = readScaleForScreen(cl);
+                        try {
+                            fd.setInt(null, v);
+                        } catch (Throwable ignored) {
+                        }
+                        log(Log.INFO, TAG, "switch screen -> reload scale, tag="
+                                + (tag == 1 ? "inner" : "outer") + " value=" + v);
+                    }
+                    return chain.proceed();
+                });
+                log(Log.INFO, TAG, "hooked ms.n.a() for per-screen scale refresh");
+            } catch (Throwable t) {
+                log(Log.ERROR, TAG, "hook ms.n.a failed: " + t);
+            }
+        } catch (Throwable t) {
+            log(Log.ERROR, TAG, "installSplitScreenScale failed: " + t);
+        }
+    }
+
+
+    /** 上次读到档位时所处的屏幕；-1 表示尚未读过。 */
+    private static volatile int sCachedTag = -1;
+
+    /**
+     * 按当前屏从 SP 读出档位。默认值沿用小红书自己的约定：
+     * ms.n$c.NORMAL.ordinal()，即 0。这里不写死 0，而是直接取枚举值，
+     * 免得将来枚举顺序变化时取到错误的档位。
+     */
+    private static int readScaleForScreen(ClassLoader cl) {
+        try {
+            Class<?> h = Class.forName("q3e.h", false, cl);
+            Object inst = h.getMethod("g").invoke(null);
+            Method j = h.getDeclaredMethod("j", String.class, int.class);
+            j.setAccessible(true);
+            int def = 0;
+            try {
+                Class<?> c = Class.forName("ms.n$c", false, cl);
+                Object normal = c.getField("NORMAL").get(null);
+                def = ((Enum<?>) normal).ordinal();
+            } catch (Throwable ignored) {
+            }
+            String key = SP_KEY + (screenTag() == 1 ? "_inner" : "_outer");
+            Object v = j.invoke(inst, key, def);
+            return ((Integer) v).intValue();
+        } catch (Throwable t) {
+            XposedModule m = sModule;
+            if (m != null) m.log(Log.ERROR, TAG, "readScaleForScreen failed: " + t);
+            return 0;
+        }
+    }
+
 }

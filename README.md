@@ -2,6 +2,9 @@
 
 LSPosed 模块,让**小红书 (com.xingin.xhs)** 在折叠屏内屏的笔记**详情页**(图文 / 视频)铺满左右,而**不改变系统 density**,也**不破坏一级信息流的多列排版**。
 
+> **v1.2 新增:内外屏「排数档位」独立记忆** —— 内屏和外屏各自记自己的手势缩放档位,
+> 互不影响。详见下方「内外屏排数档位独立记忆」一节。
+
 ## 问题原因
 
 在自定义密度(如 density=345 + 字体 125%)的折叠屏上,小红书笔记详情页左右留有大片空白。
@@ -71,6 +74,74 @@ F2  CommentListView        pad->45  w=1672
 > 说明小红书并非经由公开 setter 设置该值(内部字段级写入),因此**必须**在
 > measure / preDraw 阶段拦截,单纯 hook setter 无法解决。
 
+
+
+## 内外屏排数档位独立记忆（v1.2 新增）
+
+### 问题
+
+DPI 调低到 350 后，外屏是 534dp、内屏是 764dp，**两块屏都跨过了 600dp 这条「平板布局」分界线**。
+小红书据此把内外屏判成同一块屏，于是内屏用手势缩放调好的排数，会原封不动带到外屏 ——
+内屏舒适，外屏就小得看不清。
+
+### 根因（dexdump 取证，classes18.dex）
+
+小红书的手势缩放档位只有一份：
+
+```
+ms.n$c { ZOOM_IN=0, NORMAL=1, ZOOM_OUT=2 }        // 缩放档位
+ms.n$d { TINNY=0, SMALL=1, MIDDLE=2, BIG=3, LAGE=4 }  // 宽度分档
+
+<clinit> : d = q3e.h.g().j("screen_scale_sp_key", NORMAL)
+a()      : return d                                    // 取档位
+m(i, f)  : d = g(i, f); q3e.h.g().u("screen_scale_sp_key", d)
+```
+
+- key 固定为 `screen_scale_sp_key`，**只有一份**；
+- 只在静态字段 `ms.n.d` 里缓存一次，切屏不会重读。
+
+### 做法
+
+**不动它自己的档位体系**（枚举、`DynamicColumnFitWidth` 算法、列数计算全部保持原样），
+只在“落盘”这一步按屏拆 key：
+
+| 屏幕 | 实际使用的 key |
+|---|---|
+| 内屏 | `screen_scale_sp_key_inner` |
+| 外屏 | `screen_scale_sp_key_outer` |
+
+并在 `a()` 被调用时检查屏幕是否变了，变了就按当前屏重读一次写回 `ms.n.d`。
+
+### 屏幕判定
+
+不能用 `sw`/`dp` 判定（正是它们被 DPI 抹平才出的问题）。改用**屏幕短边像素**：
+外屏 1168、内屏 1672，与 DPI 取值完全无关。分界值优先从 `DisplayManager`
+动态算出（换机型自适应），算不出时退回本机实测的中点。
+
+### 两个实测踩出来的坑
+
+| # | 坑 | 后果 |
+|---|---|---|
+| 1 | `chain.getArgs()` 返回**不可变列表**，原地 `set()` 抛 `UnsupportedOperationException` | key 换不掉，档位全写回旧 key，且每次调用刷异常 |
+| 2 | `chain.proceedWith()` 要求 `thisObject` **精确等于声明类** `q3e.h`，实际实例是 MMKV 包装的子类 | 抛 `IllegalArgumentException` → `ms.n.<clinit>` 失败 → **小红书启动即闪退** |
+
+修法：第 1 点复制列表后再改；第 2 点改为**反射在原实例上调用**，并加 `ThreadLocal` 重入保护。
+
+### 效果
+
+| 场景 | 结果 |
+|---|---|
+| 外屏调到 2 列 → 展开内屏调到 4 列 → 合回外屏 | 外屏保持 2 列，内屏保持 4 列 |
+
+### 日志
+
+```bash
+logcat -d | grep XHSFullscreen
+# hooked SP read j(String,int)                      读取拦截就位
+# hooked SP write u(String,int)                     写入拦截就位
+# hooked ms.n.a() for per-screen scale refresh      切屏重载就位
+# switch screen -> reload scale, tag=outer value=2  切到外屏，恢复档位 2
+```
 
 ## 构建
 
