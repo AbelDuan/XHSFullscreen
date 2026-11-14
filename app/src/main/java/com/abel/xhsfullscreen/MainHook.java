@@ -686,6 +686,236 @@ public class MainHook extends XposedModule {
 
     private static final String SP_KEY = "screen_scale_sp_key";
 
+    /** 已发现的存储类，避免重复扫描 DexFile。 */
+    private static volatile Class<?> sStoreClass = null;
+
+    /** 候选类名缓存：已知的混淆名，按优先级尝试，命中即用。 */
+    private static final String[] STORE_HINTS = {"q3e.h", "s3e.h", "r3e.h", "t3e.h"};
+
+    /**
+     * 找到小红书的键值存储封装类。
+     *
+     * 这个类每次 App 更新都可能换混淆名（9.54.0 是 q3e.h，9.54.1 变成 s3e.h），
+     * 所以不能写死。先按已知名快查，失败再按结构特征全网扫描：
+     *   静态 g() 返回自身 + 实例方法 j(String,int):int 和 u(String,int):void
+     *   —— 同时具备这三个方法的类极少，足以唯一定位。
+     */
+    private static Class<?> findStoreClass(ClassLoader cl) throws ClassNotFoundException {
+        Class<?> cached = sStoreClass;
+        if (cached != null) {
+            return cached;
+        }
+        for (String n : STORE_HINTS) {
+            try {
+                Class<?> c = Class.forName(n, false, cl);
+                if (matchesStore(c)) {
+                    sStoreClass = c;
+                    return c;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        // 按特征扫描：从宿主 ClassLoader 的所有 dex 里枚举类名，逐个结构判定。
+        Class<?> found = scanDexForStore(cl);
+        if (found != null) {
+            sStoreClass = found;
+            return found;
+        }
+        throw new ClassNotFoundException("store class not found by signature");
+    }
+
+    /** 已发现的档位控制类（原 ms.n），及其内部枚举（原 ms.n$c）。 */
+    private static volatile Class<?> sScaleClass = null;
+    private static volatile Class<?> sScaleEnum = null;
+
+    /** 已知的混淆名，命中即用；未命中再按特征扫描。 */
+    private static final String[] SCALE_HINTS = {"ms.n"};
+
+    /**
+     * 找到档位控制类（9.54.1 里仍是 ms.n，但不能指望它永远不变）。
+     *
+     * 特征：静态 int 字段 + 静态 boolean 字段 + 无参实例方法 a() 返回 int。
+     * 同时满足这三条、且内部含一个名字形如 X$c 的枚举的类极少。
+     */
+    private static Class<?> findScaleClass(ClassLoader cl) throws ClassNotFoundException {
+        Class<?> cached = sScaleClass;
+        if (cached != null) {
+            return cached;
+        }
+        for (String n : SCALE_HINTS) {
+            try {
+                Class<?> c = Class.forName(n, false, cl);
+                if (matchesScale(c)) {
+                    sScaleClass = c;
+                    sScaleEnum = findScaleEnum(c, cl);
+                    return c;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        Class<?> found = scanDexForScale(cl);
+        if (found != null) {
+            sScaleClass = found;
+            sScaleEnum = findScaleEnum(found, cl);
+            return found;
+        }
+        throw new ClassNotFoundException("scale class not found by signature");
+    }
+
+    /** 结构判定：静态 int + 静态 boolean + 实例 a()I。 */
+    private static boolean matchesScale(Class<?> c) {
+        try {
+            boolean hasInt = false;
+            boolean hasBool = false;
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (!java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                    continue;
+                }
+                if (f.getType() == int.class) {
+                    hasInt = true;
+                } else if (f.getType() == boolean.class) {
+                    hasBool = true;
+                }
+            }
+            if (!hasInt || !hasBool) {
+                return false;
+            }
+            java.lang.reflect.Method a = c.getDeclaredMethod("a");
+            return a.getReturnType() == int.class
+                    && !java.lang.reflect.Modifier.isStatic(a.getModifiers());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 取内部那个档位枚举类（含 NORMAL 常量）。 */
+    private static Class<?> findScaleEnum(Class<?> scaleCls, ClassLoader cl) {
+        try {
+            for (Class<?> inner : scaleCls.getDeclaredClasses()) {
+                if (!inner.isEnum()) {
+                    continue;
+                }
+                try {
+                    inner.getField("NORMAL");
+                    return inner;
+                } catch (NoSuchFieldException ignored) {
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    /** 遍历 dex 找档位控制类。 */
+    private static Class<?> scanDexForScale(ClassLoader cl) {
+        for (Class<?> cand : iterateDexClasses(cl)) {
+            try {
+                if (matchesScale(cand)) {
+                    XposedModule m = sModule;
+                    if (m != null) {
+                        m.log(Log.INFO, TAG, "scale class found by scan: " + cand.getName());
+                    }
+                    return cand;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    /** 结构判定：静态单例 g() + j(String,int)I + u(String,int)V。 */
+    private static boolean matchesStore(Class<?> c) {
+        try {
+            java.lang.reflect.Method g = c.getDeclaredMethod("g");
+            if (!java.lang.reflect.Modifier.isStatic(g.getModifiers())) {
+                return false;
+            }
+            if (g.getReturnType() != c) {
+                return false;
+            }
+            c.getDeclaredMethod("j", String.class, int.class);
+            c.getDeclaredMethod("u", String.class, int.class);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 遍历宿主 ClassLoader 的所有 dex，返回其中能被 Class.forName 加载的类。
+     * 走 BaseDexClassLoader → pathList → dexElements → DexFile.entries()，
+     * 只读类名表，不执行任何应用代码。
+     */
+    private static java.util.List<Class<?>> iterateDexClasses(ClassLoader cl) {
+        java.util.List<Class<?>> out = new java.util.ArrayList<>();
+        try {
+            java.lang.reflect.Field pf = null;
+            Class<?> c = cl.getClass();
+            while (c != null) {
+                try {
+                    pf = c.getDeclaredField("pathList");
+                    break;
+                } catch (NoSuchFieldException e) {
+                    c = c.getSuperclass();
+                }
+            }
+            if (pf == null) {
+                return out;
+            }
+            pf.setAccessible(true);
+            Object pathList = pf.get(cl);
+            java.lang.reflect.Field ef = pathList.getClass().getDeclaredField("dexElements");
+            ef.setAccessible(true);
+            Object[] elements = (Object[]) ef.get(pathList);
+            for (Object el : elements) {
+                java.lang.reflect.Field df = el.getClass().getDeclaredField("dexFile");
+                df.setAccessible(true);
+                Object dexFile = df.get(el);
+                if (dexFile == null) {
+                    continue;
+                }
+                java.lang.reflect.Method entries = dexFile.getClass()
+                        .getDeclaredMethod("entries");
+                entries.setAccessible(true);
+                java.util.Enumeration<?> en = (java.util.Enumeration<?>) entries.invoke(dexFile);
+                while (en.hasMoreElements()) {
+                    String name = String.valueOf(en.nextElement());
+                    if (name.startsWith("Ljava/") || name.startsWith("Lkotlin/")) {
+                        continue;
+                    }
+                    String cn = name.substring(1, name.length() - 1).replace('/', '.');
+                    try {
+                        out.add(Class.forName(cn, false, cl));
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            XposedModule m = sModule;
+            if (m != null) m.log(Log.WARN, TAG, "iterateDexClasses failed: " + t);
+        }
+        return out;
+    }
+
+    /** 遍历 dex 找存储类。 */
+    private static Class<?> scanDexForStore(ClassLoader cl) {
+        for (Class<?> cand : iterateDexClasses(cl)) {
+            try {
+                if (matchesStore(cand)) {
+                    XposedModule m = sModule;
+                    if (m != null) {
+                        m.log(Log.INFO, TAG, "store class found by scan: " + cand.getName());
+                    }
+                    return cand;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+
+
     /** 内部改写 key 后自我调用时的递归保护，防止 hook 重入死循环。 */
     private static final ThreadLocal<Boolean> sInSpHook =
             ThreadLocal.withInitial(() -> Boolean.FALSE);
@@ -711,7 +941,7 @@ public class MainHook extends XposedModule {
             return cached;
         }
         try {
-            Class<?> h = Class.forName("q3e.h", false, cl);
+            Class<?> h = findStoreClass(cl);
             Object inst = h.getMethod("g").invoke(null);
             java.lang.reflect.Field fc = h.getDeclaredField("e");
             fc.setAccessible(true);
@@ -785,7 +1015,7 @@ public class MainHook extends XposedModule {
      */
     private void installSplitScreenScale(ClassLoader cl) {
         try {
-            Class<?> h = Class.forName("q3e.h", false, cl);
+            Class<?> h = findStoreClass(cl);
 
             // 读取：j(String, int) -> int
             try {
@@ -836,7 +1066,7 @@ public class MainHook extends XposedModule {
             // 这里 hook a()：发现「当前屏」与「缓存所属屏」不一致，就按当前屏
             // 重新从 SP 读一次写回 d —— 走它自己的存储路径，没有额外状态。
             try {
-                final Class<?> msn = Class.forName("ms.n", false, cl);
+                final Class<?> msn = findScaleClass(cl);
                 final java.lang.reflect.Field fd = msn.getDeclaredField("d");
                 fd.setAccessible(true);
                 Method a = msn.getDeclaredMethod("a");
@@ -855,9 +1085,9 @@ public class MainHook extends XposedModule {
                     }
                     return chain.proceed();
                 });
-                log(Log.INFO, TAG, "hooked ms.n.a() for per-screen scale refresh");
+                log(Log.INFO, TAG, "hooked scale a() for per-screen scale refresh");
             } catch (Throwable t) {
-                log(Log.ERROR, TAG, "hook ms.n.a failed: " + t);
+                log(Log.ERROR, TAG, "hook scale a() failed: " + t);
             }
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "installSplitScreenScale failed: " + t);
@@ -872,11 +1102,12 @@ public class MainHook extends XposedModule {
      */
     private static int readScaleForScreen(ClassLoader cl) {
         try {
-            Class<?> h = Class.forName("q3e.h", false, cl);
+            Class<?> h = findStoreClass(cl);
             Object inst = h.getMethod("g").invoke(null);
             Method j = h.getDeclaredMethod("j", String.class, int.class);
             j.setAccessible(true);
-            Object normal = Class.forName("ms.n$c", false, cl).getField("NORMAL").get(null);
+            findScaleClass(cl);
+            Object normal = sScaleEnum.getField("NORMAL").get(null);
             Object v = j.invoke(inst, taggedKey(SP_KEY, cl), ((Enum<?>) normal).ordinal());
             return ((Integer) v).intValue();
         } catch (Throwable t) {
