@@ -169,6 +169,38 @@ Debian 版 aapt2 2.19 解析不了 SDK 36 的 `resources.arsc`)。
 
 推送到 `main` 即触发,产物在 Actions 的 `XHSFullscreen-apk`。
 
+### ⚠️ APK 必须按 4 字节对齐(v1.7.1 修复)
+
+Android R+ (targetSdk >= 30) 在安装阶段硬性要求:
+`resources.arsc` 必须**不压缩**,且数据起点**按 4 字节对齐**。否则安装直接失败:
+
+```
+Install Failure 1#-124 [-124: Failed parse during installPackageLI:
+Targeting R+ (version 30 and above) requires the resources.arsc of installed
+APKs to be stored uncompressed and aligned on a 4-byte boundary]
+```
+
+v1.7.0 及更早的 **Release 附件**就是这个缺陷 —— 手机上装不上。
+
+| 产物来源 | 对齐 | 说明 |
+|---|---|---|
+| GitHub Actions (Gradle/AGP) | ✅ | AGP 自动对齐,没问题 |
+| `build_dexswap.sh` (v1.7.0 及更早) | ❌ | `zipfile.writestr` 整包重写,不做任何填充 |
+| `build_dexswap.sh` (v1.7.1 起) | ✅ | 自己写 ZIP 结构,逐条用 extra field 补齐 |
+
+**两个关键点**(v1.7.1 踩出来的):
+
+1. **打包**必须自己拼 ZIP 结构。`zipfile.writestr` 不会做对齐填充;
+   改为逐条写本地文件头/中央目录,用 alignment padding extra field (id `0xd935`)
+   把每个条目的数据起点补到 4 的倍数。
+2. **签名必须用 `apksigner`(v2/v3)**,不能用 `jarsigner`。
+   jarsigner 走 v1 方案,会把 `MANIFEST.MF` 塞回包里**重新写一遍 zip**,
+   对齐当场丢失(实测 `resources.arsc` 从 `mod4=0` 变回 `mod1`)。
+   apksigner 只在文件末尾追加签名块,原 zip 结构原样保留。
+
+脚本末尾的校验段会直接读原始字节复核 `resources.arsc` 的压缩方式与对齐,
+不通过就直接 `exit 1`,不会产出坏包。
+
 ## 安装
 
 ### ⚠️ 用 `cp` 覆盖,不要反复 `pm install`
