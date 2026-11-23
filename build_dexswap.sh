@@ -56,6 +56,154 @@ java -cp "$R8_JAR" com.android.tools.r8.D8 \
   $(find "$OUT/classes" -name '*.class')
 
 echo "[3/4] dexswap 组装（复用 BASE 的资源，只换 dex）..."
+# ---- 先把版本号写进 BASE 的二进制清单 ----
+# dexswap 复用 BASE 的资源与清单，build.gradle 里的 versionCode/versionName
+# **不会**进入产物（清单是 BASE 的）。v1.7.1 首次发布就栽在这里：
+# 装上去 versionName 还是 1.7。这里直接改二进制清单，改动最小：
+#   versionCode  → 属性区里的整数立即数，原地改
+#   versionName  → 字符串池里的条目，原地改写（消耗池尾填充余量）
+VCODE="$(sed -n 's/^[[:space:]]*versionCode[[:space:]]\+\([0-9]\+\).*/\1/p' app/build.gradle | head -1)"
+VNAME="$(sed -n 's/^[[:space:]]*versionName[[:space:]]*"\(.*\)".*/\1/p' app/build.gradle | head -1)"
+if [ -z "$VCODE" ] || [ -z "$VNAME" ]; then
+  echo "读不到 app/build.gradle 里的 versionCode / versionName" >&2
+  exit 1
+fi
+echo "  写入版本: versionCode=$VCODE versionName=$VNAME"
+python3 - "$BASE" "$OUT/AndroidManifest.xml" "$VCODE" "$VNAME" <<'PY'
+# 把版本号写进 BASE 的二进制清单。
+# 关键点：二进制 XML 的 UTF-16 串编码是
+#     u16 长度 + 内容 + u16 NUL 终止符   （宽度为奇数时再补一个 NUL）
+# 少了终止符，apksig / PackageManager 会直接报
+#     UTF-16 encoded form of string not NULL terminated
+# 池里条目之间只有 2 字节间隙，所以版本号变长时不能原地改写，
+# 这里重排整个字符串池并平移其后所有块。
+import sys, struct, zipfile
+
+RES_STRING_POOL_TYPE = 0x0001
+RES_XML_START_ELEMENT_TYPE = 0x0102
+INT_DEC = 0x10
+UTF8_FLAG = 0x100
+
+
+def read_pool(m, off):
+    hsize = struct.unpack('<H', m[off + 2:off + 4])[0]
+    size = struct.unpack('<I', m[off + 4:off + 8])[0]
+    count, style_count, flags, sstart, stystart = struct.unpack('<IIIII', m[off + 8:off + 28])
+    if flags & UTF8_FLAG:
+        raise SystemExit('只支持 UTF-16 字符串池')
+    offsets = list(struct.unpack('<%dI' % count, m[off + hsize:off + hsize + 4 * count]))
+    data = off + sstart
+    strs = []
+    for i in range(count):
+        p = data + offsets[i]
+        n = struct.unpack('<H', m[p:p + 2])[0]
+        strs.append(m[p + 2:p + 2 + n * 2].decode('utf-16-le'))
+    return dict(off=off, hsize=hsize, size=size, count=count, style_count=style_count,
+                flags=flags, sstart=sstart, stystart=stystart, strings=strs)
+
+
+def build_pool(off, pool):
+    """按 2 字节对齐重排所有条目，返回新的池块字节。"""
+    body = bytearray()
+    offsets = []
+    for s in pool['strings']:
+        offsets.append(len(body))
+        # 二进制 XML 的 UTF-16 串编码：u16 长度 + 内容 + **u16 NUL 终止符**。
+        # 走 ARSC 风格时宽度还需是偶数（奇数则再补一个 NUL）。缺终止符会让
+        # apksig / PackageManager 直接报 "UTF-16 encoded form of string not NULL terminated"。
+        body += struct.pack('<H', len(s)) + s.encode('utf-16-le') + b'\x00\x00'
+        if len(s) % 2:
+            body += b'\x00\x00'
+    if len(body) % 4:
+        body += b'\x00' * (4 - len(body) % 4)
+    hsize = 28
+    sstart = hsize + 4 * pool['count']
+    size = sstart + len(body)
+    hdr = struct.pack('<HHIIIIII', RES_STRING_POOL_TYPE, hsize, size, pool['count'],
+                      0, pool['flags'] & ~UTF8_FLAG, sstart, 0)
+    return hdr + struct.pack('<%dI' % pool['count'], *offsets) + bytes(body)
+
+
+def manifest_attrs(m, pool, total):
+    found = {}
+    pos = pool['off'] + pool['size']
+    while pos < total:
+        ctyp, chdr, csz = struct.unpack('<HHI', m[pos:pos + 8])
+        if ctyp == RES_XML_START_ELEMENT_TYPE:
+            tag = pool['strings'][struct.unpack('<I', m[pos + 20:pos + 24])[0]]
+            if tag == 'manifest':
+                ast, asz, ac = struct.unpack('<HHH', m[pos + 24:pos + 30])
+                for k in range(ac):
+                    a = pos + chdr + ast + k * asz
+                    found[pool['strings'][struct.unpack('<I', m[a + 4:a + 8])[0]]] = a
+                break
+        pos += csz
+    return found
+
+
+def patch(m, vcode, vname):
+    total = struct.unpack('<I', m[4:8])[0]
+    if total != len(m):
+        raise SystemExit('清单长度与文件头不一致 %d != %d' % (total, len(m)))
+    pool = read_pool(m, 8)
+    attrs = manifest_attrs(m, pool, total)
+
+    # versionCode：属性区原地改
+    a = attrs.get('versionCode')
+    if a is None or m[a + 15] != INT_DEC:
+        raise SystemExit('找不到整数型 versionCode 属性')
+    m = bytearray(m)
+    struct.pack_into('<I', m, a + 16, vcode)
+
+    # versionName：改池下标对应条目
+    a = attrs.get('versionName')
+    if a is None:
+        raise SystemExit('找不到 versionName 属性')
+    idx = struct.unpack('<I', m[a + 8:a + 12])[0]
+    old = pool['strings'][idx]
+    strings = list(pool['strings'])
+    strings[idx] = vname
+
+    # 重建池并平移后续块
+    new_pool = build_pool(8, dict(pool, strings=strings))
+    delta = len(new_pool) - pool['size']
+    tail = bytes(m[pool['off'] + pool['size']:])
+    out = bytearray(m[:8]) + bytearray(new_pool) + bytearray(tail)
+    struct.pack_into('<I', out, 4, len(out))
+
+    # 平移后属性区移位，versionName 的 rawValue 索引不变（池下标没变）
+    # 但 versionCode 已在上面直接写入，需要重新定位并确认
+    npool = read_pool(out, 8)
+    nattrs = manifest_attrs(out, npool, len(out))
+    ca = nattrs.get('versionCode')
+    if ca is not None:
+        struct.pack_into('<I', out, ca + 16, vcode)
+
+    print('   versionName %r -> %r' % (old, vname))
+    print('   versionCode -> %d' % vcode)
+    print('   字符串池 %d -> %d 字节 (delta %+d)' % (pool['size'], len(new_pool), delta))
+    return bytes(out), npool, nattrs
+
+apk, out_path, vcode, vname = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+m = zipfile.ZipFile(apk).read('AndroidManifest.xml')
+patched, npool, nattrs = patch(m, vcode, vname)
+
+# 结构自检：块链必须首尾相接覆盖全文
+pos = 8 + struct.unpack('<I', patched[12:16])[0]
+while pos < len(patched):
+    t, h, sz = struct.unpack('<HHI', patched[pos:pos + 8])
+    if sz < 8 or pos + sz > len(patched):
+        raise SystemExit('清单块链损坏 @%d size=%d' % (pos, sz))
+    pos += sz
+if pos != len(patched):
+    raise SystemExit('清单块链未覆盖全文 %d != %d' % (pos, len(patched)))
+if struct.unpack('<I', patched[4:8])[0] != len(patched):
+    raise SystemExit('清单文件头长度不符')
+
+open(out_path, 'wb').write(patched)
+print('  清单: versionCode=%d versionName=%r' % (vcode, vname))
+PY
+
 # ⚠ 必须自己写 zip 结构，不能用 zipfile.writestr 直接整包重写。
 #   Android R+ (targetSdk >= 30) 在 instalPackageLI 阶段硬性要求
 #   resources.arsc「不压缩 + 数据起点按 4 字节对齐」，否则安装直接失败：
@@ -66,10 +214,10 @@ echo "[3/4] dexswap 组装（复用 BASE 的资源，只换 dex）..."
 #   Gradle/AGP 会自动对齐，所以 CI 产物没这个问题 —— 只有本脚本产物有。
 #   下面按 ZIP 规范逐条写本地文件头/中央目录，用 extra field 把每个条目
 #   的数据起点补齐到 4 字节边界。
-python3 - "$BASE" "$OUT/dex/classes.dex" "$OUT/app-unsigned.apk" <<'PY'
+python3 - "$BASE" "$OUT/dex/classes.dex" "$OUT/app-unsigned.apk" "$OUT/AndroidManifest.xml" <<'PY'
 import sys, zipfile, struct, zlib
 
-base, dex, out = sys.argv[1:4]
+base, dex, out, manifest = sys.argv[1:5]
 drop = ('classes.dex', 'classes2.dex', 'META-INF/MANIFEST.MF')
 
 items = []
@@ -80,6 +228,10 @@ with zipfile.ZipFile(base) as zin:
             continue
         # 丢掉 BASE 的旧签名，稍后重新签
         if n.startswith('META-INF/') and n.upper().endswith(('.SF', '.RSA', '.DSA', '.EC')):
+            continue
+        # 清单用上一步写入了版本号的那份替换（其余内容完全一致）
+        if n == 'AndroidManifest.xml':
+            items.append((n, open(manifest, 'rb').read(), it.compress_type, it.date_time))
             continue
         items.append((n, zin.read(n), it.compress_type, it.date_time))
 items.append(('classes.dex', open(dex, 'rb').read(), zipfile.ZIP_DEFLATED,
@@ -168,8 +320,8 @@ echo
 echo "构建完成: $APK"
 ls -la "$APK"
 echo "--- 校验 ---"
-python3 - "$APK" <<'PY'
-import zipfile, sys
+python3 - "$APK" "$VCODE" "$VNAME" <<'PY'
+import zipfile, sys, struct
 z = zipfile.ZipFile(sys.argv[1])
 names = z.namelist()
 dex = [n for n in names if n.endswith('.dex')]
@@ -212,4 +364,42 @@ if data_off % 4:
     print(f"!! resources.arsc 数据起点 {data_off} 未按 4 字节对齐，Android R+ 会拒绝安装")
     sys.exit(1)
 print(f"  对齐: resources.arsc STORED @ {data_off} (mod 4 = 0) OK")
+
+# 版本号：dexswap 复用 BASE 的清单，必须确认补丁真的写进去了。
+want_code, want_name = sys.argv[2], sys.argv[3]
+man = z.read("AndroidManifest.xml")
+tot = struct.unpack("<I", man[4:8])[0]
+psize = struct.unpack("<I", man[12:16])[0]
+cnt = struct.unpack("<I", man[16:20])[0]
+sstart = struct.unpack("<I", man[28:32])[0]
+sof = struct.unpack("<%dI" % cnt, man[36:36 + 4 * cnt])
+sbase = 8 + sstart
+
+
+def _s(i):
+    q = sbase + sof[i]
+    ln = struct.unpack("<H", man[q:q + 2])[0]
+    return man[q + 2:q + 2 + ln * 2].decode("utf-16-le")
+
+
+got = {}
+q = 8 + psize
+while q < tot:
+    t2, h2, z2 = struct.unpack("<HHI", man[q:q + 8])
+    if t2 == 0x0102 and _s(struct.unpack("<I", man[q + 20:q + 24])[0]) == "manifest":
+        ast, asz, ac = struct.unpack("<HHH", man[q + 24:q + 30])
+        for k in range(ac):
+            a2 = q + h2 + ast + k * asz
+            nm = _s(struct.unpack("<I", man[a2 + 4:a2 + 8])[0])
+            dt2 = man[a2 + 15]
+            dv = struct.unpack("<I", man[a2 + 16:a2 + 20])[0]
+            if nm in ("versionCode", "versionName"):
+                got[nm] = str(dv) if dt2 == 0x10 else _s(dv)
+        break
+    q += z2
+print(f"  版本: versionCode={got.get('versionCode')} versionName={got.get('versionName')}")
+if got.get("versionCode") != want_code or got.get("versionName") != want_name:
+    print(f"!! 清单版本号不对：期望 {want_code}/{want_name}，"
+          f"实际 {got.get('versionCode')}/{got.get('versionName')}")
+    sys.exit(1)
 PY

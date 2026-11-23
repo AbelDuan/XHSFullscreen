@@ -201,6 +201,33 @@ v1.7.0 及更早的 **Release 附件**就是这个缺陷 —— 手机上装不�
 脚本末尾的校验段会直接读原始字节复核 `resources.arsc` 的压缩方式与对齐,
 不通过就直接 `exit 1`,不会产出坏包。
 
+### ⚠️ dexswap 产物必须自己把版本号写进清单(v1.7.1 修复)
+
+dexswap 方案**复用 BASE APK 的资源与清单**,只替换 `classes.dex`。
+所以 `app/build.gradle` 里的 `versionCode` / `versionName` **根本不会进入产物** ——
+清单永远是 BASE 那一份。v1.7.1 第一次发布就栽在这里:包已经装上了,
+`versionName` 还显示 `1.7`。
+
+v1.7.1 起,`build_dexswap.sh` 直接从 `app/build.gradle` 读取版本号,
+改写 BASE 的**二进制** `AndroidManifest.xml`:
+
+- `versionCode` 是属性区的整数立即数,原地改 4 字节;
+- `versionName` 是字符串池里的条目,改长度通常不同,必须**重排整个字符串池**
+  并平移其后的所有块。
+
+**两个必须知道的细节**:
+
+1. 字符串池里条目之间**只有 2 字节间隙**。`"1.7"` → `"1.7.1"` 需要多 4 字节,
+   原地改写会覆盖下一项的前 2 字节 → 清单解析失败,
+   装包报 `INSTALL_PARSE_FAILED_UNEXPECTED_EXCEPTION`。
+2. 二进制 XML 的 UTF-16 串编码是
+   **`u16 长度` + 内容 + `u16 NUL 终止符`**(宽度为奇数时再补一个 NUL)。
+   少了终止符,apksig 与 PackageManager 都会直接报
+   `UTF-16 encoded form of string not NULL terminated`。
+
+脚本会在写出前做结构自检(块链首尾相接、文件头长度、条目不重叠),
+并且 `[4/4]` 之后还会从成品 APK 里回读版本号,对不上就 `exit 1`。
+
 ## 安装
 
 ### ⚠️ 用 `cp` 覆盖,不要反复 `pm install`
