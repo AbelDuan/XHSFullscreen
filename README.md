@@ -23,6 +23,15 @@ LSPosed 模块,让**小红书 (com.xingin.xhs)** 在折叠屏内屏的笔记**�
 >
 > **v2.1.1 修复:详情页图片顶出下边缘、标题被切** —— 可用高度里补上了标题块的预留
 > (`title`, 默认 150px)。
+>
+> **v2.1.6 修复:切屏/旋转闪一下 + 横屏列数被锁** —— 三条:
+> ①列数改成**换屏时同步改**(原来延迟 400ms,新屏先按旧列数画一帧再跳,肉眼就是闪),
+> 改之前临时摘掉 `ItemAnimator`,布局稳定再装回;
+> ②横竖屏判定改用 `Configuration`(Activity 的 `DisplayMetrics` 在
+> `onConfigurationChanged` 里会滞后一帧,把横屏当竖屏 → 横屏被锁成竖屏的列数);
+> ③**横屏完全不干预**:列数、档位 key 全交还给小红书自己,并显式把静态档位 `d`
+> 还原成 plain key 的值(否则第一次转进横屏会拿着上一个屏的档位算列数)。
+> 详见「横竖屏与按屏记忆」一节。
 
 ## 问题原因
 
@@ -157,7 +166,7 @@ a()     →  if (b) return d; else return NORMAL             只在 b 为真时�
 日志:
 
 ```bash
-logcat -d | grep XHSFullscreen | grep -E "screen short side|screenTag|SPAN"
+logcat -d | grep XHSFullscreen | grep -E "screen state|screenTag|SPAN"
 # screen short side -> 1168 (1168x1712)
 # screenTag -> outer shortSide=1168 divider=1420
 # switch screen -> reload scale, tag=outer value=2
@@ -441,3 +450,41 @@ logcat -d | grep XHSFullscreen
 - 测试环境:折叠屏、Android 17、KSU + Zygisk + LSPosed 2.2.1 (API 102)、小红书 9.50.0。
 - 边距宽度 `PAD_TARGET`(px)与阈值 `PAD_THRESHOLD`(低于此值的对称内边距不处理)可在
   `MainHook.java` 顶部调整。
+
+## 横竖屏与按屏记忆(v2.1.6)
+
+用户要的行为:**竖屏时两块屏各自记忆列数,横屏不受模块影响、跟随小红书默认。**
+
+### 三个坑
+
+1. **延迟改列数会闪**。v2.1.1 是 `postDelayed(400)`,新屏会先按旧列数画一帧,
+   再"啪"一下换成正确列数。改成在 `onConfigurationChanged` 里**同步**改
+   (此时新窗口还没布局),第一帧就是对的;再补一次 150ms 后的**幂等**复检
+   (值已经对了就什么都不做)。改之前顺手把 `ItemAnimator` 摘掉(250ms 后装回),
+   否则列表重排会带条目动画,看起来还是"闪"。
+2. **`DisplayMetrics` 在换屏/旋转的那一帧是滞后的**。实测 `onConfigurationChanged`
+   里读 Activity 的 metrics,横屏仍报竖屏尺寸,于是 `isPortrait()` 判成竖屏,
+   横屏被强制成竖屏的列数(用户看到"横屏也是 3 列")。
+   现在屏状态(`sScreenShort` / `sScreenWidth` / `sPortrait`)统一由
+   `updateFromConfig(Configuration)` 更新:`screenWidthDp`/`screenHeightDp`
+   已按当前方向给值,`densityDpi` 换算 px 与 DPI 设置无关,任何时机都可信。
+3. **横屏"不干预"还不够**。列数是 `e(屏宽px)` 配 `a()` 的档位算的,而档位存在
+   静态字段 `d` 里 —— 展开进横屏时 `d` 还留着上一个屏的值,于是横屏拿外屏的档位算列数
+   (实测 3 列),转两次才对。现在横屏分支会先把 `d` 还原成 plain key 的值
+   (`readScalePlain`),结果与来源屏无关;用户横屏捏合写的也是 plain key,所以一致。
+
+### 现在的规则
+
+| 方向 | 档位来源 | 列数由谁定 |
+| --- | --- | --- |
+| 竖屏 | `screen_scale_sp_key_inner` / `_outer`(各记各的) | 模块按该屏 `e(宽px)` 同步 `setSpanCount` |
+| 横屏 | `screen_scale_sp_key`(小红书原值) | 小红书自己 `f()` 算,模块完全不碰 |
+
+日志里能直接看出走了哪条:
+
+```
+screen state -> short=1671 width=2365 landscape (cfg 1081x764 @350)   ← 横屏,放行
+SPAN screen=inner scale=1 spanCount=4
+screen state -> short=1168 width=1168 portrait (cfg 534x783 @350)     ← 竖屏,接管
+SPAN forced 4 list(s) -> 2 (onConfigurationChanged, sync)
+```

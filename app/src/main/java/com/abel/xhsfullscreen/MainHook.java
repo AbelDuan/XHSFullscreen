@@ -326,7 +326,10 @@ public class MainHook extends XposedModule {
             Method onResume = Activity.class.getDeclaredMethod("onResume");
             hook(onResume).intercept(chain -> {
                 try {
-                    scheduleFix((Activity) chain.getThisObject());
+                    Activity act = (Activity) chain.getThisObject();
+                    refreshScreenShort(act);
+                    scheduleFix(act);
+                    applyFeedSpan(act.getClass().getClassLoader(), "onResume", false);
                 } catch (Throwable ignored) {
                 }
                 return chain.proceed();
@@ -341,9 +344,13 @@ public class MainHook extends XposedModule {
                 Object r = chain.proceed();
                 try {
                     Activity act = (Activity) chain.getThisObject();
+                    Object cfg = chain.getArgs().isEmpty() ? null : chain.getArgs().get(0);
+                    if (cfg instanceof Configuration) {
+                        updateFromConfig((Configuration) cfg);
+                    }
                     refreshScreenShort(act);
                     scheduleFix(act);
-                    applyFeedSpan(act.getClass().getClassLoader(), "onConfigurationChanged");
+                    applyFeedSpan(act.getClass().getClassLoader(), "onConfigurationChanged", true);
                 } catch (Throwable ignored) {
                 }
                 return r;
@@ -573,7 +580,12 @@ public class MainHook extends XposedModule {
             if (dm == null || dm.widthPixels <= 0) {
                 return;
             }
+            // 一律以 Configuration 为准：Activity 的 DisplayMetrics 在
+            // onConfigurationChanged 里可能还没刷新，会把横屏当竖屏，
+            // 于是横屏也被强制成竖屏的列数（实测就是这样把横屏锁成 3 列的）。
+            updateFromConfig(a.getResources().getConfiguration());
             int shortSide = Math.min(dm.widthPixels, dm.heightPixels);
+            sScreenWidth = dm.widthPixels;
             if (shortSide != sScreenShort) {
                 sScreenShort = shortSide;
                 XposedModule m = sModule;
@@ -1307,6 +1319,17 @@ public class MainHook extends XposedModule {
      */
     private static volatile int sScreenShort = 0;
 
+    /** 当前屏的宽度像素（横竖屏不同）。小红书算列数用的是它，不是短边。 */
+    private static volatile int sScreenWidth = 0;
+
+    /**
+     * 当前是否竖屏。
+     *
+     * 用户的要求：竖屏各自记忆列数，横屏不要被模块影响，交给小红书自己默认走。
+     * 所以所有「按屏改写档位 / 强制列数」的动作都只在竖屏下做。
+     */
+    private static volatile boolean sPortrait = true;
+
     /** 上次读到档位时所处的屏幕；-1 表示尚未读过。 */
     private static volatile int sCachedTag = -1;
 
@@ -1489,6 +1512,77 @@ public class MainHook extends XposedModule {
         }
     }
 
+    /**
+     * 用 Configuration 更新「当前在哪块屏、横还是竖、宽度多少」。
+     *
+     * Configuration.screenWidthDp/screenHeightDp 已经按当前方向给值
+     * （横屏时 screenWidthDp > screenHeightDp），densityDpi 换 px 与 DPI 设置无关，
+     * 所以这三个量在任何时机都是可信的 —— 不像 DisplayMetrics 会滞后一帧。
+     */
+    private static void updateFromConfig(Configuration cfg) {
+        if (cfg == null) {
+            return;
+        }
+        try {
+            float density = cfg.densityDpi / 160f;
+            if (density <= 0f) {
+                return;
+            }
+            int wDp = cfg.screenWidthDp;
+            int hDp = cfg.screenHeightDp;
+            boolean portrait = cfg.orientation == Configuration.ORIENTATION_PORTRAIT;
+            if (wDp > 0 && hDp > 0 && wDp != hDp) {
+                portrait = hDp >= wDp;
+            }
+            int widthPx = Math.round((portrait ? Math.min(wDp, hDp) : Math.max(wDp, hDp)) * density);
+            int shortPx = Math.round(Math.min(wDp, hDp) * density);
+            boolean changed = portrait != sPortrait || shortPx != sScreenShort
+                    || widthPx != sScreenWidth;
+            sPortrait = portrait;
+            sScreenWidth = widthPx;
+            sScreenShort = shortPx;
+            if (changed) {
+                sCachedTag = -1;    // 换屏/换方向后重新按当前屏读一次档位
+            }
+            if (changed) {
+                XposedModule m = sModule;
+                if (m != null) {
+                    m.log(Log.INFO, TAG, "screen state -> short=" + shortPx
+                            + " width=" + widthPx
+                            + " " + (portrait ? "portrait" : "landscape")
+                            + " (cfg " + wDp + "x" + hDp + " @" + cfg.densityDpi + ")");
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 当前屏宽度像素（横屏时是大的一边）。 */
+    private static int currentWidthPx() {
+        int fromActivity = sScreenWidth;
+        if (fromActivity > 0) {
+            return fromActivity;
+        }
+        android.content.Context ctx = currentContext();
+        if (ctx != null) {
+            android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+            return dm.widthPixels;
+        }
+        return currentShortSidePx();
+    }
+
+    private static boolean isPortrait() {
+        if (sScreenWidth > 0) {
+            return sPortrait;
+        }
+        android.content.Context ctx = currentContext();
+        if (ctx != null) {
+            android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+            return dm.heightPixels >= dm.widthPixels;
+        }
+        return true;
+    }
+
     /** 当前进程的 Application Context（模块启动时还没有 Activity）。 */
     private static android.content.Context sAppContext = null;
 
@@ -1514,6 +1608,10 @@ public class MainHook extends XposedModule {
     /** 小红书原始的档位 key → 按屏区分后的 key。其它 key 原样返回。 */
     private static String taggedKey(String key, ClassLoader cl) {
         if (!SP_KEY.equals(key)) {
+            return key;
+        }
+        // 横屏用原 key，让小红书走它自己那套默认值，不做按屏区分。
+        if (!isPortrait()) {
             return key;
         }
         return SP_KEY + (screenTag(cl) == 1 ? "_inner" : "_outer");
@@ -1599,6 +1697,23 @@ public class MainHook extends XposedModule {
                 Method a = msn.getDeclaredMethod("a");
                 a.setAccessible(true);
                 hook(a).intercept(chain -> {
+                    if (!isPortrait()) {
+                        // 横屏：用小红书自己的那份档位（plain key）。
+                        //
+                        // 之前这里只是「不干预」，但静态字段 d 还留着上一个屏的档位，
+                        // 于是第一次转进横屏会拿着外屏的档位去算列数（实测 3 列），
+                        // 转两次才对 —— 因为中途竖屏把 d 换回了内屏的值。
+                        // 横屏必须显式把 d 还原成 plain key 的值，结果才与来源屏无关。
+                        int plain = readScalePlain(cl);
+                        try {
+                            if (fd.getInt(null) != plain) {
+                                fd.setInt(null, plain);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                        sCachedTag = -1;
+                        return chain.proceed();
+                    }
                     int tag = screenTag(cl);
                     if (tag != sCachedTag) {
                         sCachedTag = tag;
@@ -1609,7 +1724,7 @@ public class MainHook extends XposedModule {
                         }
                         log(Log.INFO, TAG, "switch screen -> reload scale, tag="
                                 + (tag == 1 ? "inner" : "outer") + " value=" + v);
-                        applyFeedSpan(cl, "scale a() tag change");
+                        applyFeedSpan(cl, "scale a() tag change", false);
                     }
                     return chain.proceed();
                 });
@@ -1731,6 +1846,55 @@ public class MainHook extends XposedModule {
         }
     }
 
+    /**
+     * 临时摘掉 RecyclerView 的条目动画，返回「装回去」的 Runnable。
+     * 模块编译时没有 androidx 依赖，全部走反射。
+     */
+    private static Runnable suppressItemAnimations(Object lm) {
+        try {
+            Object rv = null;
+            Class<?> c = lm.getClass();
+            while (c != null) {
+                try {
+                    java.lang.reflect.Field f = c.getDeclaredField("mRecyclerView");
+                    f.setAccessible(true);
+                    rv = f.get(lm);
+                    break;
+                } catch (NoSuchFieldException e) {
+                    c = c.getSuperclass();
+                }
+            }
+            if (rv == null) {
+                return null;
+            }
+            final Object rvF = rv;
+            Method getAnim = rv.getClass().getMethod("getItemAnimator");
+            final Object anim = getAnim.invoke(rv);
+            if (anim == null) {
+                return null;
+            }
+            for (Method m : rv.getClass().getMethods()) {
+                if (m.getName().equals("setItemAnimator") && m.getParameterTypes().length == 1) {
+                    m.invoke(rv, new Object[]{null});
+                    break;
+                }
+            }
+            return () -> {
+                try {
+                    for (Method m : rvF.getClass().getMethods()) {
+                        if (m.getName().equals("setItemAnimator") && m.getParameterTypes().length == 1) {
+                            m.invoke(rvF, anim);
+                            break;
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            };
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
     /** 当前屏「应有」的列数：直接借小红书自己的 e(屏宽px) 算，不自己编映射。 */
     private static int desiredSpan(ClassLoader cl) {
         try {
@@ -1738,7 +1902,7 @@ public class MainHook extends XposedModule {
             Object inst = msn.getField("a").get(null);
             Method e = msn.getDeclaredMethod("e", int.class);
             e.setAccessible(true);
-            Object v = e.invoke(inst, currentShortSidePx());
+            Object v = e.invoke(inst, currentWidthPx());
             return v instanceof Integer ? (Integer) v : -1;
         } catch (Throwable t) {
             XposedModule m = sModule;
@@ -1753,49 +1917,97 @@ public class MainHook extends XposedModule {
      * 换屏后调用：把记下来的网格 LayoutManager 的列数改成当前屏应有的值。
      * 延迟 400ms，等新窗口布局完成后再改，避免和正在进行的测量打架。
      */
-    private static void applyFeedSpan(final ClassLoader cl, String why) {
+    private static final android.os.Handler sMain =
+            new android.os.Handler(android.os.Looper.getMainLooper());
+
+    /**
+     * 换屏后把信息流列数改成当前屏应有的值。
+     *
+     * ⚠ 时机很关键：v2.1.1 是延迟 400ms 再改，结果新屏先按旧列数画了一帧、
+     * 再"啪"一下换成正确列数 —— 肉眼就是切屏时闪一下。
+     * 现在改成在 `onConfigurationChanged` 里**同步**改（此时新窗口还没布局），
+     * 第一帧就是对的；再补一次 150ms 后的幂等复检，防止列表随后被重建。
+     */
+    private static void applyFeedSpan(final ClassLoader cl, final String why, final boolean immediate) {
         if (!sSpanForce) {
             return;
         }
+        // 横屏交给小红书自己：它按真实宽度分档，我们不去覆盖。
+        if (!isPortrait()) {
+            return;
+        }
+        final int want;
         try {
-            final int want = desiredSpan(cl);
-            if (want <= 0) {
-                return;
-            }
-            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
-                int changed = 0;
-                synchronized (sFeedLms) {
-                    for (java.util.Iterator<java.lang.ref.WeakReference<Object>> it =
-                         sFeedLms.iterator(); it.hasNext(); ) {
-                        Object lm = it.next().get();
-                        if (lm == null) {
-                            it.remove();
+            want = desiredSpan(cl);
+        } catch (Throwable t) {
+            return;
+        }
+        if (want <= 0) {
+            return;
+        }
+        final Runnable task = () -> {
+            int changed = 0;
+            synchronized (sFeedLms) {
+                for (java.util.Iterator<java.lang.ref.WeakReference<Object>> it =
+                     sFeedLms.iterator(); it.hasNext(); ) {
+                    Object lm = it.next().get();
+                    if (lm == null) {
+                        it.remove();
+                        continue;
+                    }
+                    try {
+                        Method get = lm.getClass().getMethod("getSpanCount");
+                        int cur = (Integer) get.invoke(lm);
+                        if (cur == want) {
                             continue;
                         }
-                        try {
-                            Method get = lm.getClass().getMethod("getSpanCount");
-                            int cur = (Integer) get.invoke(lm);
-                            if (cur == want) {
-                                continue;
-                            }
-                            Method set = lm.getClass().getMethod("setSpanCount", int.class);
-                            set.invoke(lm, want);
-                            changed++;
-                        } catch (Throwable ignored) {
+                        // 改列数会让列表重排，如果开着条目动画，肉眼看就是"闪一下"。
+                        // 改之前把 ItemAnimator 摘掉，布局稳定后再装回去。
+                        Runnable restore = suppressItemAnimations(lm);
+                        Method set = lm.getClass().getMethod("setSpanCount", int.class);
+                        set.invoke(lm, want);
+                        if (restore != null) {
+                            sMain.postDelayed(restore, 250L);
                         }
+                        changed++;
+                    } catch (Throwable ignored) {
                     }
                 }
-                XposedModule m = sModule;
-                if (m != null && changed > 0) {
-                    m.log(Log.INFO, TAG, "SPAN forced " + changed + " list(s) -> " + want
-                            + " (" + why + ")");
-                }
-            }, 400L);
+            }
+            XposedModule m = sModule;
+            if (m != null && changed > 0) {
+                m.log(Log.INFO, TAG, "SPAN forced " + changed + " list(s) -> " + want
+                        + " (" + why + (immediate ? ", sync" : ", posted") + ")");
+            }
+        };
+        try {
+            if (immediate && android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                task.run();               // 在 onConfigurationChanged 里同步改，赶在新布局之前
+            } else {
+                sMain.post(task);
+            }
+            sMain.postDelayed(task, 150L); // 幂等复检：值已经对了就什么都不做
         } catch (Throwable t) {
             XposedModule m = sModule;
             if (m != null) {
                 m.log(Log.WARN, TAG, "applyFeedSpan failed: " + t);
             }
+        }
+    }
+
+    /** 读小红书自己那份档位（plain key），横屏时用它。 */
+    private static int readScalePlain(ClassLoader cl) {
+        try {
+            Class<?> h = findStoreClass(cl);
+            Object inst = h.getMethod("g").invoke(null);
+            Method j = h.getDeclaredMethod("j", String.class, int.class);
+            j.setAccessible(true);
+            findScaleClass(cl);
+            Object normal = sScaleEnum.getField("NORMAL").get(null);
+            Object v = j.invoke(inst, SP_KEY, ((Enum<?>) normal).ordinal());
+            return ((Integer) v).intValue();
+        } catch (Throwable t) {
+            return 1;   // NORMAL
         }
     }
 
