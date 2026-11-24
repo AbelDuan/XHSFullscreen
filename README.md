@@ -488,3 +488,43 @@ SPAN screen=inner scale=1 spanCount=4
 screen state -> short=1168 width=1168 portrait (cfg 534x783 @350)     ← 竖屏,接管
 SPAN forced 4 list(s) -> 2 (onConfigurationChanged, sync)
 ```
+
+## 正式版的开销(v2.1.7)
+
+原则:**正式版零调试输出、零逐帧垃圾**。排查能力靠一个运行期开关,不靠常开代码。
+
+### 哪些东西默认是关的
+
+| 东西 | 默认 | 打开方式 |
+| --- | --- | --- |
+| 全部 `Log.INFO` 调试日志 | **关**(一行都不写) | `echo debug=1 >> /data/local/tmp/xhsfullscreen.conf` 再 `am force-stop com.xingin.xhs` |
+| 逐帧 FRAME 日志 `VERBOSE` | **编译期常量 false** | 改常量重编(javac 会把整块丢掉,不生成字节码) |
+| 视图树 dump `DEBUG_TREE` / `tree=1` | **关** | conf 里 `tree=1` |
+| 对照实验 `OBSERVE_ONLY` | 编译期常量 false | 改常量重编 |
+
+`Log.WARN` / `Log.ERROR` 不走开关 —— 只在真的出问题时出现(找不到类、hook 失败)。
+
+实测(本机 2026-11-25):正式版启动到首页 **0 行** XHSFullscreen 日志;
+同一次运行把 conf 改成 `debug=1` 立刻打出 39 行 —— 证明不是「模块没加载」,
+而是日志确实被开关挡住了。
+
+### 逐帧路径上还剩什么
+
+详情页的目标容器各挂一个 `OnPreDrawListener`(共 4 类容器)。每帧只做:
+
+- 两次 `getPaddingLeft/Right()` + 一次整数比较(值对了就什么都不写);
+- 图片展示区多两步:`getTag()` 取已缓存好的画廊 View,再看缓存里那对宽高是否还等于
+  `LayoutParams` —— 相等就直接返回。
+
+v2.1.7 之前这里每帧都会递归下潜 3 层找 `ImageGalleryView`(每次 `getClass().getName()
+.contains()`),现在第一次找到就记在展示区的 tag 上,之后每帧只多一次 tag 读。
+
+### hook 点开销
+
+- `setPadding` / `setPaddingRelative` 只挂在 4 个目标类(及其父类实现)上,
+  不挂全局 `View` —— 别的界面完全不受影响;
+- `RecyclerView.setLayoutManager` 的拦截器不再每次反射 `getLayoutManager()`,
+  直接用刚设进来的那个参数;
+- 存储读写 `h.j` / `h.u` 只在 key 是 `screen_scale_sp_key` 时才改写参数,
+  其它键一次判等就 `proceed()`;
+- 类查找有缓存(`sStoreClass` / `sScaleClass`),dex 特征扫描只在混淆名变动时跑一次。

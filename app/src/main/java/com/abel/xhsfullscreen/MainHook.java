@@ -128,8 +128,19 @@ public class MainHook extends XposedModule {
     /** 图片画廊的类名特征（宽度被写死的就是它）。 */
     private static final String GALLERY_CLASS_HINT = "ImageGalleryView";
 
+    /**
+     * 调试日志总开关（正式版 = false）。
+     *
+     * 所有 Log.INFO 都包在 `if (sDebug)` 里：关掉时既不写 logcat，也不拼接
+     * 消息字符串 —— 热点路径（PreDraw、setter 拦截、换屏回调）上一次判断的代价。
+     * 需要排查时不用重编：`echo debug=1 >> /data/local/tmp/xhsfullscreen.conf`
+     * 再 am force-stop com.xingin.xhs 重开即可。
+     * Log.WARN / Log.ERROR 不走这个开关 —— 它们只在真的出问题时出现。
+     */
+    private static volatile boolean sDebug = false;
+
     // 逐帧观测开关：记录每帧绘制时 padding 的真实值，用于验证
-    // 「打开帖子前边距就已定好」。定稿后可关掉。
+    // 「打开帖子前边距就已定好」。正式版恒为 false（编译期常量，整块不生成字节码）。
     private static final boolean VERBOSE = false;
 
     // 视图层级诊断开关：把详情页整棵树的 类名/宽高/内边距/LayoutParams 打进
@@ -144,7 +155,8 @@ public class MainHook extends XposedModule {
     // 为了不因为「调 30px 还是 22px 边距」这种小事反复重启，这几个参数改成
     // 从配置文件读：改文件 → am force-stop com.xingin.xhs → 重开即生效。
     //
-    //   tree=1        打印详情页视图树（定位用）
+    //   debug=1       打开调试日志（默认关，正式版零 logcat 输出）
+    //   tree=1        打印详情页视图树（定位用，默认关）
     //   fill=1        把详情页图片区强制撑到满宽（本次新增功能）
     //   pad=45        内容区左右内边距（px）
     //   margin=22     图片区左右留白（px），fill 生效时的目标边距
@@ -186,11 +198,15 @@ public class MainHook extends XposedModule {
         // 入口可观测性：LSPosed 每次把本模块注入目标进程都会经过这里。
         // 没有这条日志就无法区分「模块没被加载」和「加载了但逻辑没命中」——
         // 排查时那是两个完全不同的方向，所以保留为常规 INFO 输出。
-        log(Log.INFO, TAG, "onPackageLoaded: " + param.getPackageName());
+        if (sDebug) {
+            log(Log.INFO, TAG, "onPackageLoaded: " + param.getPackageName());
+        }
         if (!XHS.equals(param.getPackageName())) {
             return;
         }
-        log(Log.INFO, TAG, "hooked into XHS, installing hooks (v1.9.0)");
+        if (sDebug) {
+            log(Log.INFO, TAG, "hooked into XHS, installing hooks (v1.9.0)");
+        }
         sModule = this;
         loadConf();
         // ★ 这个调用以前漏了：hookActivityLifecycle() 只定义、从没被调用过，
@@ -220,11 +236,15 @@ public class MainHook extends XposedModule {
                         if (!hookedClasses.contains(cn)) {
                             hookedClasses.add(cn);
                             hookPaddingSetters(c);
-                            log(Log.INFO, TAG, "pre-hooked setters: " + cn);
+                            if (sDebug) {
+                                log(Log.INFO, TAG, "pre-hooked setters: " + cn);
+                            }
                         }
                     }
                 } catch (Throwable t) {
-                    log(Log.INFO, TAG, "pre-hook skipped " + cn + ": " + t);
+                    if (sDebug) {
+                        log(Log.INFO, TAG, "pre-hook skipped " + cn + ": " + t);
+                    }
                 }
             }
 
@@ -248,13 +268,17 @@ public class MainHook extends XposedModule {
                     }
                     return r;
                 });
-                log(Log.INFO, TAG, "hooked wj9.c0.y0 (source-level normalize)");
+                if (sDebug) {
+                    log(Log.INFO, TAG, "hooked wj9.c0.y0 (source-level normalize)");
+                }
             } catch (Throwable t) {
                 // 这个方法名属于 9.50~9.54 的混淆名，9.55.0 已经不叫这个名字
                 // （NoSuchMethodException）。它是「提速」而不是「必需」：
                 // 真正保证首帧正确的还是 setter 预注册 + PreDraw 守卫，
                 // 所以这里降级为 INFO，不再当错误刷日志。
-                log(Log.INFO, TAG, "wj9.c0.y0 not present in this version: " + t);
+                if (sDebug) {
+                    log(Log.INFO, TAG, "wj9.c0.y0 not present in this version: " + t);
+                }
             }
         }
 
@@ -297,8 +321,10 @@ public class MainHook extends XposedModule {
                                     int pl = v.getPaddingLeft();
                                     XposedModule m = sModule;
                                     if (m != null) {
-                                        m.log(Log.INFO, TAG, "CTOR " + cn
-                                                + " initialPad=" + pl);
+                                        if (sDebug) {
+                                            m.log(Log.INFO, TAG, "CTOR " + cn
+                                                    + " initialPad=" + pl);
+                                        }
                                     }
                                     // ⚠ 构造期不写 padding。
                                     // CommentListView 可能是在 RecyclerView 复用 /
@@ -313,9 +339,13 @@ public class MainHook extends XposedModule {
                             return r;
                         });
                     }
-                    log(Log.INFO, TAG, "hooked ctors: " + cn);
+                    if (sDebug) {
+                        log(Log.INFO, TAG, "hooked ctors: " + cn);
+                    }
                 } catch (Throwable t) {
-                    log(Log.INFO, TAG, "ctor hook skipped " + cn + ": " + t);
+                    if (sDebug) {
+                        log(Log.INFO, TAG, "ctor hook skipped " + cn + ": " + t);
+                    }
                 }
             }
         }
@@ -490,70 +520,7 @@ public class MainHook extends XposedModule {
         };
     }
 
-    /** 完整调用栈，用于定位真正的赋值入口（不做任何裁剪）。 */
-    private static String fullStack() {
-        try {
-            StackTraceElement[] st = new Throwable().getStackTrace();
-            StringBuilder sb = new StringBuilder();
-            for (StackTraceElement e : st) {
-                sb.append("      ").append(e.getClassName()).append('.')
-                  .append(e.getMethodName()).append(':').append(e.getLineNumber()).append('\n');
-            }
-            return sb.toString();
-        } catch (Throwable t) {
-            return "      <stack failed>";
-        }
-    }
 
-    /** 只保留与小红书自身业务相关的调用帧，最多 8 层，避免日志刷屏。 */
-    private static String shortStack() {
-        try {
-            StackTraceElement[] st = new Throwable().getStackTrace();
-            StringBuilder sb = new StringBuilder();
-            int n = 0;
-            for (StackTraceElement e : st) {
-                String c = e.getClassName();
-                // 跳过框架与自身
-                if (c.startsWith("android.") || c.startsWith("java.")
-                        || c.startsWith("com.android.") || c.startsWith("io.github.libxposed")
-                        || c.startsWith(MainHook.class.getName())
-                        || c.startsWith("LSPosed") || c.contains("XposedBridge")
-                        || c.contains("$Proxy") || c.contains("LSP"))
-                    continue;
-                sb.append("    ").append(c).append('.').append(e.getMethodName())
-                  .append(':').append(e.getLineNumber()).append('\n');
-                if (++n >= 8) break;
-            }
-            return sb.length() == 0 ? "    (no app frames)" : sb.toString();
-        } catch (Throwable t) {
-            return "    <stack failed>";
-        }
-    }
-
-    /**
-     * 探测某个类的方法签名，用于把混淆名映射到真实签名。
-     * 只打印名字里带 "y0"/"c0" 嫌疑的类，控制日志量。
-     */
-    private void probeClass(String className, ClassLoader cl) {
-        try {
-            Class<?> c = Class.forName(className, false, cl);
-            log(Log.INFO, TAG, "PROBE " + className + " methods:");
-            for (Method m : c.getDeclaredMethods()) {
-                StringBuilder sb = new StringBuilder();
-                sb.append("    ").append(m.getReturnType().getSimpleName())
-                  .append(' ').append(m.getName()).append('(');
-                Class<?>[] ps = m.getParameterTypes();
-                for (int i = 0; i < ps.length; i++) {
-                    if (i > 0) sb.append(", ");
-                    sb.append(ps[i].getSimpleName());
-                }
-                sb.append(')');
-                log(Log.INFO, TAG, sb.toString());
-            }
-        } catch (Throwable t) {
-            log(Log.ERROR, TAG, "probe " + className + " failed: " + t);
-        }
-    }
 
     private void scheduleFix(final Activity a) {
         try {
@@ -590,8 +557,10 @@ public class MainHook extends XposedModule {
                 sScreenShort = shortSide;
                 XposedModule m = sModule;
                 if (m != null) {
-                    m.log(Log.INFO, TAG, "screen short side -> " + shortSide
-                            + " (" + dm.widthPixels + "x" + dm.heightPixels + ")");
+                    if (sDebug) {
+                        m.log(Log.INFO, TAG, "screen short side -> " + shortSide
+                                + " (" + dm.widthPixels + "x" + dm.heightPixels + ")");
+                    }
                 }
             }
         } catch (Throwable ignored) {
@@ -636,7 +605,9 @@ public class MainHook extends XposedModule {
                 boolean fresh = v.getTag(TAG_GUARD) == null;
                 ensureGuard(v);
                 if (fresh) {
-                    log(Log.INFO, TAG, "guard on (fixView): " + cn);
+                    if (sDebug) {
+                        log(Log.INFO, TAG, "guard on (fixView): " + cn);
+                    }
                 }
             }
         } catch (Throwable ignored) {
@@ -711,11 +682,15 @@ public class MainHook extends XposedModule {
         try {
             View root = v.getRootView();
             int[] lines = new int[]{0};
-            m.log(Log.INFO, TAG, "TREE " + why
-                    + " screenShort=" + currentShortSidePx()
-                    + " v=" + v.getWidth() + "x" + v.getHeight());
+            if (sDebug) {
+                m.log(Log.INFO, TAG, "TREE " + why
+                        + " screenShort=" + currentShortSidePx()
+                        + " v=" + v.getWidth() + "x" + v.getHeight());
+            }
             dumpNode(root, 0, m, lines);
-            m.log(Log.INFO, TAG, "TREE end lines=" + lines[0]);
+            if (sDebug) {
+                m.log(Log.INFO, TAG, "TREE end lines=" + lines[0]);
+            }
         } catch (Throwable t) {
             m.log(Log.WARN, TAG, "dumpTree failed: " + t);
         }
@@ -737,11 +712,15 @@ public class MainHook extends XposedModule {
         try {
             View root = v.getRootView();
             int[] lines = new int[]{0};
-            m.log(Log.INFO, TAG, "TREE " + why
-                    + " screenShort=" + currentShortSidePx()
-                    + " v=" + v.getWidth() + "x" + v.getHeight());
+            if (sDebug) {
+                m.log(Log.INFO, TAG, "TREE " + why
+                        + " screenShort=" + currentShortSidePx()
+                        + " v=" + v.getWidth() + "x" + v.getHeight());
+            }
             dumpNode(root, 0, m, lines);
-            m.log(Log.INFO, TAG, "TREE end lines=" + lines[0]);
+            if (sDebug) {
+                m.log(Log.INFO, TAG, "TREE end lines=" + lines[0]);
+            }
         } catch (Throwable t) {
             m.log(Log.WARN, TAG, "dumpTree failed: " + t);
         }
@@ -773,11 +752,23 @@ public class MainHook extends XposedModule {
      * 画廊不是 display 的直接子节点（层级是 display → LinearLayout → ImageGalleryView），
      * 所以这里按类名下潜找，最多 3 层。
      */
+    /** 第一次找到的画廊 View，缓存到展示区的 tag 上，避免每帧递归下潜。 */
+    private static final int TAG_FIT_GAL = 0x584853_47;   // 'XHSG'
+
     private static void fitGallery(View display) {
         if (!sFill || !(display instanceof ViewGroup)) {
             return;
         }
         try {
+            Object cachedGal = display.getTag(TAG_FIT_GAL);
+            if (cachedGal instanceof View) {
+                View gal = (View) cachedGal;
+                if (gal.getParent() != null) {
+                    fitOneGallery(gal, display);
+                    return;
+                }
+                display.setTag(TAG_FIT_GAL, null);
+            }
             fitGalleryIn((ViewGroup) display, display, 0);
         } catch (Throwable t) {
             XposedModule m = sModule;
@@ -798,6 +789,7 @@ public class MainHook extends XposedModule {
                 continue;
             }
             if (c.getClass().getName().contains(GALLERY_CLASS_HINT)) {
+                display.setTag(TAG_FIT_GAL, c);
                 fitOneGallery(c, display);
             } else if (c instanceof ViewGroup && c.getVisibility() == View.VISIBLE) {
                 fitGalleryIn((ViewGroup) c, display, depth + 1);
@@ -857,8 +849,10 @@ public class MainHook extends XposedModule {
         gal.setLayoutParams(lp);
         XposedModule m = sModule;
         if (m != null) {
-            m.log(Log.INFO, TAG, "FIT gallery -> " + w + "x" + h
-                    + " ratio=" + ratio + " avail=" + availW + "x" + availH);
+            if (sDebug) {
+                m.log(Log.INFO, TAG, "FIT gallery -> " + w + "x" + h
+                        + " ratio=" + ratio + " avail=" + availW + "x" + availH);
+            }
         }
     }
 
@@ -940,7 +934,9 @@ public class MainHook extends XposedModule {
             if (v.getVisibility() != View.VISIBLE) {
                 sb.append(" vis=").append(v.getVisibility());
             }
-            m.log(Log.INFO, TAG, sb.toString());
+            if (sDebug) {
+                m.log(Log.INFO, TAG, sb.toString());
+            }
             lines[0]++;
             if (v instanceof ViewGroup) {
                 ViewGroup vg = (ViewGroup) v;
@@ -1014,10 +1010,12 @@ public class MainHook extends XposedModule {
                                     top = v.getTop();
                                     if (pv != null && pv.getHeight() > 0) {
                                         // 记录父级高度，判断内容是否撑满
-                                        m.log(Log.INFO, TAG, "PARENT "
-                                                + v.getClass().getSimpleName()
-                                                + " ph=" + pv.getHeight()
-                                                + " pw=" + pv.getWidth());
+                                        if (sDebug) {
+                                            m.log(Log.INFO, TAG, "PARENT "
+                                                    + v.getClass().getSimpleName()
+                                                    + " ph=" + pv.getHeight()
+                                                    + " pw=" + pv.getWidth());
+                                        }
                                     }
                                 } catch (Throwable ignored) {
                                 }
@@ -1026,14 +1024,16 @@ public class MainHook extends XposedModule {
                                     sc = v.getScrollY();
                                 } catch (Throwable ignored) {
                                 }
-                                m.log(Log.INFO, TAG, "FRAME " + frame + " "
-                                        + v.getClass().getSimpleName()
-                                        + " pad=" + v.getPaddingLeft()
-                                        + " w=" + v.getWidth()
-                                        + " h=" + v.getHeight()
-                                        + " top=" + top
-                                        + " scrollY=" + sc
-                                        + " vis=" + v.getVisibility());
+                                if (sDebug) {
+                                    m.log(Log.INFO, TAG, "FRAME " + frame + " "
+                                            + v.getClass().getSimpleName()
+                                            + " pad=" + v.getPaddingLeft()
+                                            + " w=" + v.getWidth()
+                                            + " h=" + v.getHeight()
+                                            + " top=" + top
+                                            + " scrollY=" + sc
+                                            + " vis=" + v.getVisibility());
+                                }
                             }
                             frame++;
                         }
@@ -1185,7 +1185,9 @@ public class MainHook extends XposedModule {
                 if (matchesScale(cand)) {
                     XposedModule m = sModule;
                     if (m != null) {
-                        m.log(Log.INFO, TAG, "scale class found by scan: " + cand.getName());
+                        if (sDebug) {
+                            m.log(Log.INFO, TAG, "scale class found by scan: " + cand.getName());
+                        }
                     }
                     return cand;
                 }
@@ -1293,7 +1295,9 @@ public class MainHook extends XposedModule {
                 if (matchesStore(cand)) {
                     XposedModule m = sModule;
                     if (m != null) {
-                        m.log(Log.INFO, TAG, "store class found by scan: " + cand.getName());
+                        if (sDebug) {
+                            m.log(Log.INFO, TAG, "store class found by scan: " + cand.getName());
+                        }
                     }
                     return cand;
                 }
@@ -1398,7 +1402,9 @@ public class MainHook extends XposedModule {
             sDivider = lo + (hi - lo) / 2;
             XposedModule mod = sModule;
             if (mod != null) {
-                mod.log(Log.INFO, TAG, "divider=" + sDivider + " (" + lo + "~" + hi + ")");
+                if (sDebug) {
+                    mod.log(Log.INFO, TAG, "divider=" + sDivider + " (" + lo + "~" + hi + ")");
+                }
             }
             return sDivider;
         } catch (Throwable t) {
@@ -1429,8 +1435,10 @@ public class MainHook extends XposedModule {
             sLastTag = tag;
             XposedModule m = sModule;
             if (m != null) {
-                m.log(Log.INFO, TAG, "screenTag -> " + (tag == 1 ? "inner" : "outer")
-                        + " shortSide=" + shortSide + " divider=" + divider);
+                if (sDebug) {
+                    m.log(Log.INFO, TAG, "screenTag -> " + (tag == 1 ? "inner" : "outer")
+                            + " shortSide=" + shortSide + " divider=" + divider);
+                }
             }
         }
         return tag;
@@ -1469,8 +1477,10 @@ public class MainHook extends XposedModule {
         try {
             java.io.File f = new java.io.File(CONF_PATH);
             if (!f.exists()) {
-                log(Log.INFO, TAG, "conf absent, defaults tree=" + sTree + " fill=" + sFill
-                        + " pad=" + sPad + " margin=" + sMargin);
+                if (sDebug) {
+                    log(Log.INFO, TAG, "conf absent, defaults tree=" + sTree + " fill=" + sFill
+                            + " pad=" + sPad + " margin=" + sMargin);
+                }
                 return;
             }
             java.util.Properties p = new java.util.Properties();
@@ -1487,8 +1497,11 @@ public class MainHook extends XposedModule {
             sBottom = intConf(p, "bottom", 110);
             sTitle = intConf(p, "title", 150);
             sSpanForce = boolConf(p, "spanforce", true);
-            log(Log.INFO, TAG, "conf tree=" + sTree + " fill=" + sFill
-                    + " pad=" + sPad + " margin=" + sMargin);
+            sDebug = boolConf(p, "debug", false);
+            if (sDebug) {
+                log(Log.INFO, TAG, "conf tree=" + sTree + " fill=" + sFill
+                        + " pad=" + sPad + " margin=" + sMargin);
+            }
         } catch (Throwable t) {
             log(Log.WARN, TAG, "loadConf failed: " + t);
         }
@@ -1547,10 +1560,12 @@ public class MainHook extends XposedModule {
             if (changed) {
                 XposedModule m = sModule;
                 if (m != null) {
-                    m.log(Log.INFO, TAG, "screen state -> short=" + shortPx
-                            + " width=" + widthPx
-                            + " " + (portrait ? "portrait" : "landscape")
-                            + " (cfg " + wDp + "x" + hDp + " @" + cfg.densityDpi + ")");
+                    if (sDebug) {
+                        m.log(Log.INFO, TAG, "screen state -> short=" + shortPx
+                                + " width=" + widthPx
+                                + " " + (portrait ? "portrait" : "landscape")
+                                + " (cfg " + wDp + "x" + hDp + " @" + cfg.densityDpi + ")");
+                    }
                 }
             }
         } catch (Throwable ignored) {
@@ -1646,7 +1661,9 @@ public class MainHook extends XposedModule {
                         sInSpHook.set(Boolean.FALSE);
                     }
                 });
-                log(Log.INFO, TAG, "hooked SP read j(String,int)");
+                if (sDebug) {
+                    log(Log.INFO, TAG, "hooked SP read j(String,int)");
+                }
             } catch (Throwable t) {
                 log(Log.ERROR, TAG, "hook SP read failed: " + t);
             }
@@ -1666,7 +1683,9 @@ public class MainHook extends XposedModule {
                                 || k.contains("refresh")) {
                             XposedModule mod = sModule;
                             if (mod != null) {
-                                mod.log(Log.INFO, TAG, "SPW " + orig.get(0) + " = " + orig.get(1));
+                                if (sDebug) {
+                                    mod.log(Log.INFO, TAG, "SPW " + orig.get(0) + " = " + orig.get(1));
+                                }
                             }
                         }
                     }
@@ -1682,7 +1701,9 @@ public class MainHook extends XposedModule {
                     }
                     return null;
                 });
-                log(Log.INFO, TAG, "hooked SP write u(String,int)");
+                if (sDebug) {
+                    log(Log.INFO, TAG, "hooked SP write u(String,int)");
+                }
             } catch (Throwable t) {
                 log(Log.ERROR, TAG, "hook SP write failed: " + t);
             }
@@ -1722,13 +1743,17 @@ public class MainHook extends XposedModule {
                             fd.setInt(null, v);
                         } catch (Throwable ignored) {
                         }
-                        log(Log.INFO, TAG, "switch screen -> reload scale, tag="
-                                + (tag == 1 ? "inner" : "outer") + " value=" + v);
+                        if (sDebug) {
+                            log(Log.INFO, TAG, "switch screen -> reload scale, tag="
+                                    + (tag == 1 ? "inner" : "outer") + " value=" + v);
+                        }
                         applyFeedSpan(cl, "scale a() tag change", false);
                     }
                     return chain.proceed();
                 });
-                log(Log.INFO, TAG, "hooked scale a() for per-screen scale refresh");
+                if (sDebug) {
+                    log(Log.INFO, TAG, "hooked scale a() for per-screen scale refresh");
+                }
 
                 // 诊断：spanCount 的真实计算入口 f(Context)I，把它每次的返回值打出来，
                 // 就能直接看到「这一屏 XHS 认为是几列」，不用再猜。
@@ -1744,15 +1769,19 @@ public class MainHook extends XposedModule {
                             if (span != sLastSpan || tag != sSpanTag) {
                                 sLastSpan = span;
                                 sSpanTag = tag;
-                                log(Log.INFO, TAG, "SPAN screen="
-                                        + (tag == 1 ? "inner" : "outer")
-                                        + " scale=" + safeScale(cl)
-                                        + " spanCount=" + span);
+                                if (sDebug) {
+                                    log(Log.INFO, TAG, "SPAN screen="
+                                            + (tag == 1 ? "inner" : "outer")
+                                            + " scale=" + safeScale(cl)
+                                            + " spanCount=" + span);
+                                }
                             }
                         }
                         return r;
                     });
-                    log(Log.INFO, TAG, "hooked ms.n.f(Context) for spanCount log");
+                    if (sDebug) {
+                        log(Log.INFO, TAG, "hooked ms.n.f(Context) for spanCount log");
+                    }
                 } catch (Throwable t) {
                     log(Log.WARN, TAG, "hook spanCount f() failed: " + t);
                 }
@@ -1811,18 +1840,17 @@ public class MainHook extends XposedModule {
             Method slm = rv.getDeclaredMethod("setLayoutManager", lmCls);
             slm.setAccessible(true);
             hook(slm).intercept(chain -> {
-                Object r = chain.proceed();
+                // 刚设进来的那个 LayoutManager 就是参数，不必再反射 getLayoutManager()
+                // （每次 setLayoutManager 都做一次反射查找，纯浪费）。
                 try {
-                    Object lm = chain.getThisObject();
-                    java.lang.reflect.Method getLm = rv.getDeclaredMethod("getLayoutManager");
-                    getLm.setAccessible(true);
-                    Object cur = getLm.invoke(lm);
-                    rememberLm(cur);
+                    rememberLm(chain.getArgs().get(0));
                 } catch (Throwable ignored) {
                 }
-                return r;
+                return chain.proceed();
             });
-            log(Log.INFO, TAG, "hooked RecyclerView.setLayoutManager (feed span tracking)");
+            if (sDebug) {
+                log(Log.INFO, TAG, "hooked RecyclerView.setLayoutManager (feed span tracking)");
+            }
         } catch (Throwable t) {
             log(Log.WARN, TAG, "hook setLayoutManager failed: " + t);
         }
@@ -1839,9 +1867,13 @@ public class MainHook extends XposedModule {
                     rememberLm(chain.getThisObject());
                     return chain.proceed();
                 });
-                log(Log.INFO, TAG, "hooked " + cn + ".setSpanCount");
+                if (sDebug) {
+                    log(Log.INFO, TAG, "hooked " + cn + ".setSpanCount");
+                }
             } catch (Throwable t) {
-                log(Log.INFO, TAG, "skip " + cn + ": " + t);
+                if (sDebug) {
+                    log(Log.INFO, TAG, "skip " + cn + ": " + t);
+                }
             }
         }
     }
@@ -1976,8 +2008,10 @@ public class MainHook extends XposedModule {
             }
             XposedModule m = sModule;
             if (m != null && changed > 0) {
-                m.log(Log.INFO, TAG, "SPAN forced " + changed + " list(s) -> " + want
-                        + " (" + why + (immediate ? ", sync" : ", posted") + ")");
+                if (sDebug) {
+                    m.log(Log.INFO, TAG, "SPAN forced " + changed + " list(s) -> " + want
+                            + " (" + why + (immediate ? ", sync" : ", posted") + ")");
+                }
             }
         };
         try {
