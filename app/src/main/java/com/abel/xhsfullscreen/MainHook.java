@@ -159,6 +159,13 @@ public class MainHook extends XposedModule {
     // 底部预留：评论输入条是「浮在内容上」的（不是布局的一部分），
     // 所以滚动视口一直延伸到屏幕最底。图片要「不出屏」，就得把这条的高度让出来。
     private static volatile int sBottom = 110;
+    // 标题预留：图片下方是标题/正文块（在 CommentListView 里），
+    // 想「图片看全 + 标题也看全」，就得把标题那几行的高度一起让出来。
+    private static volatile int sTitle = 150;
+    // 换屏后强制把信息流列数改成「当前屏应有的列数」。
+    // 小红书自己不会在折叠换屏后重算 spanCount（列表继续用旧值），
+    // 这就是「内外屏列数强制同步」的真正原因。
+    private static volatile boolean sSpanForce = true;
 
     // 对照实验开关：true = 只观测不改布局。
     //
@@ -186,6 +193,11 @@ public class MainHook extends XposedModule {
         log(Log.INFO, TAG, "hooked into XHS, installing hooks (v1.9.0)");
         sModule = this;
         loadConf();
+        // ★ 这个调用以前漏了：hookActivityLifecycle() 只定义、从没被调用过，
+        // 所以 onResume/onConfigurationChanged 的 hook 从来没装上，
+        // refreshScreenShort / scheduleFix 也就从来没跑过。
+        // 折叠换屏时正是靠 onConfigurationChanged 才能拿到「新屏」的 DisplayMetrics。
+        hookActivityLifecycle();
 
         // ★ 主动预注册：不等实例出现，直接用全限定名把目标类的 setter hook 好。
         //
@@ -260,6 +272,7 @@ public class MainHook extends XposedModule {
         // 档位体系本身（枚举、算法 DynamicColumnFitWidth、列数计算）完全不动。
         if (cl0 != null) {
             installSplitScreenScale(cl0);
+            installFeedSpanForce(cl0);
         }
 
         // 注：曾在这里 hook NestedScrollLayout 的滚动偏移 B，想消除「打开时
@@ -327,7 +340,10 @@ public class MainHook extends XposedModule {
             hook(onCfg).intercept(chain -> {
                 Object r = chain.proceed();
                 try {
-                    scheduleFix((Activity) chain.getThisObject());
+                    Activity act = (Activity) chain.getThisObject();
+                    refreshScreenShort(act);
+                    scheduleFix(act);
+                    applyFeedSpan(act.getClass().getClassLoader(), "onConfigurationChanged");
                 } catch (Throwable ignored) {
                 }
                 return r;
@@ -534,6 +550,7 @@ public class MainHook extends XposedModule {
 
     private void scheduleFix(final Activity a) {
         try {
+            refreshScreenShort(a);
             final View decor = a.getWindow().getDecorView();
             if (decor == null) {
                 return;
@@ -546,6 +563,26 @@ public class MainHook extends XposedModule {
             decor.postDelayed(() -> fixContent(a), 800);
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "scheduleFix error: " + t);
+        }
+    }
+
+    /** 用 Activity 自己的 DisplayMetrics 记录当前屏短边（换屏时 onConfigurationChanged 也会进来）。 */
+    private static void refreshScreenShort(Activity a) {
+        try {
+            android.util.DisplayMetrics dm = a.getResources().getDisplayMetrics();
+            if (dm == null || dm.widthPixels <= 0) {
+                return;
+            }
+            int shortSide = Math.min(dm.widthPixels, dm.heightPixels);
+            if (shortSide != sScreenShort) {
+                sScreenShort = shortSide;
+                XposedModule m = sModule;
+                if (m != null) {
+                    m.log(Log.INFO, TAG, "screen short side -> " + shortSide
+                            + " (" + dm.widthPixels + "x" + dm.heightPixels + ")");
+                }
+            }
+        } catch (Throwable ignored) {
         }
     }
 
@@ -612,6 +649,11 @@ public class MainHook extends XposedModule {
             }
             v.setTag(TAG_GUARD, Boolean.TRUE);
             attachLayoutGuard(v);
+            // 首帧的 dump 里子视图还没量好（标题块高度为 0），
+            // 这里再补一次「布局稳定后」的全树快照，用于定位标题块的真实位置。
+            if (sTree && v.getClass().getName().contains("NoteDetailContentView")) {
+                v.postDelayed(() -> dumpTreeNow(v, "settled"), 1500L);
+            }
         } catch (Throwable ignored) {
         }
     }
@@ -649,6 +691,24 @@ public class MainHook extends XposedModule {
      * 找一个「图片比预期小」的问题，唯一可靠的办法就是看实际数字：
      * 是容器被限宽、是 padding 吃掉了宽度、还是图片本身按比例缩了。
      */
+    private static void dumpTreeNow(View v, String why) {
+        XposedModule m = sModule;
+        if (m == null) {
+            return;
+        }
+        try {
+            View root = v.getRootView();
+            int[] lines = new int[]{0};
+            m.log(Log.INFO, TAG, "TREE " + why
+                    + " screenShort=" + currentShortSidePx()
+                    + " v=" + v.getWidth() + "x" + v.getHeight());
+            dumpNode(root, 0, m, lines);
+            m.log(Log.INFO, TAG, "TREE end lines=" + lines[0]);
+        } catch (Throwable t) {
+            m.log(Log.WARN, TAG, "dumpTree failed: " + t);
+        }
+    }
+
     private static void dumpTreeIfDue(View v, String why) {
         if (!sTree) {
             return;
@@ -766,7 +826,7 @@ public class MainHook extends XposedModule {
 
         int margin = sMargin;
         int availW = display.getWidth() - margin * 2;
-        int availH = availableHeight(gal) - sBottom - margin * 2;
+        int availH = availableHeight(gal) - sBottom - sTitle - margin * 2;
         if (availW <= 0 || availH <= 0) {
             return;
         }
@@ -846,7 +906,10 @@ public class MainHook extends XposedModule {
             for (int i = 0; i < depth; i++) {
                 sb.append(' ');
             }
+            int[] scr = new int[2];
+            v.getLocationOnScreen(scr);
             sb.append(v.getClass().getSimpleName())
+              .append(" y=").append(scr[1])
               .append(" w=").append(v.getWidth())
               .append(" h=").append(v.getHeight())
               .append(" pl=").append(v.getPaddingLeft())
@@ -1234,6 +1297,16 @@ public class MainHook extends XposedModule {
     private static final ThreadLocal<Boolean> sInSpHook =
             ThreadLocal.withInitial(() -> Boolean.FALSE);
 
+    /**
+     * 当前所在屏的短边像素。
+     *
+     * 实测（v2.0.4 日志）：Application/Resources.getSystem() 的 DisplayMetrics 在折叠换屏后
+     * 不一定会刷新，导致内屏也被判成 outer —— 于是两边读写同一个 key，表现就是「列数强制同步」。
+     * Activity 的 Resources 是跟着它自己的显示配置走的，所以在 onResume/onConfigurationChanged
+     * 里用 Activity 的 metrics 记一次，判定优先用它。
+     */
+    private static volatile int sScreenShort = 0;
+
     /** 上次读到档位时所处的屏幕；-1 表示尚未读过。 */
     private static volatile int sCachedTag = -1;
 
@@ -1321,10 +1394,23 @@ public class MainHook extends XposedModule {
      *
      * @return 1 = 内屏，0 = 外屏
      */
+    private static volatile int sLastTag = -1;
+    private static volatile int sLastSpan = -1;
+    private static volatile int sSpanTag = -1;
+
     private static int screenTag(ClassLoader cl) {
         int shortSide = currentShortSidePx();
         int divider = divider(cl);
-        return divider > 0 && shortSide >= divider ? 1 : 0;
+        int tag = divider > 0 && shortSide >= divider ? 1 : 0;
+        if (tag != sLastTag) {
+            sLastTag = tag;
+            XposedModule m = sModule;
+            if (m != null) {
+                m.log(Log.INFO, TAG, "screenTag -> " + (tag == 1 ? "inner" : "outer")
+                        + " shortSide=" + shortSide + " divider=" + divider);
+            }
+        }
+        return tag;
     }
 
     /**
@@ -1336,6 +1422,10 @@ public class MainHook extends XposedModule {
      * 那样切到外屏也判成内屏。两级都有兜底，都是为了得到「当前屏」而不是「开机那屏」。
      */
     private static int currentShortSidePx() {
+        int fromActivity = sScreenShort;
+        if (fromActivity > 0) {
+            return fromActivity;
+        }
         android.content.Context ctx = currentContext();
         if (ctx != null) {
             try {
@@ -1372,6 +1462,8 @@ public class MainHook extends XposedModule {
             sPad = intConf(p, "pad", PAD_TARGET);
             sMargin = intConf(p, "margin", 22);
             sBottom = intConf(p, "bottom", 110);
+            sTitle = intConf(p, "title", 150);
+            sSpanForce = boolConf(p, "spanforce", true);
             log(Log.INFO, TAG, "conf tree=" + sTree + " fill=" + sFill
                     + " pad=" + sPad + " margin=" + sMargin);
         } catch (Throwable t) {
@@ -1467,6 +1559,19 @@ public class MainHook extends XposedModule {
                 u.setAccessible(true);
                 hook(u).intercept(chain -> {
                     List<Object> orig = chain.getArgs();
+                    if (sTree) {
+                        // 只记和「排数/缩放」相关的写入，否则登录态、版本号之类
+                        // 的键会把日志刷满，真正有用的那行找不到。
+                        String k = String.valueOf(orig.get(0)).toLowerCase(java.util.Locale.ROOT);
+                        if (k.contains("scale") || k.contains("span") || k.contains("column")
+                                || k.contains("grid") || k.contains("feed_layout")
+                                || k.contains("refresh")) {
+                            XposedModule mod = sModule;
+                            if (mod != null) {
+                                mod.log(Log.INFO, TAG, "SPW " + orig.get(0) + " = " + orig.get(1));
+                            }
+                        }
+                    }
                     String nk = taggedKey((String) orig.get(0), cl);
                     if (nk.equals(orig.get(0)) || Boolean.TRUE.equals(sInSpHook.get())) {
                         return chain.proceed();
@@ -1504,15 +1609,193 @@ public class MainHook extends XposedModule {
                         }
                         log(Log.INFO, TAG, "switch screen -> reload scale, tag="
                                 + (tag == 1 ? "inner" : "outer") + " value=" + v);
+                        applyFeedSpan(cl, "scale a() tag change");
                     }
                     return chain.proceed();
                 });
                 log(Log.INFO, TAG, "hooked scale a() for per-screen scale refresh");
+
+                // 诊断：spanCount 的真实计算入口 f(Context)I，把它每次的返回值打出来，
+                // 就能直接看到「这一屏 XHS 认为是几列」，不用再猜。
+                try {
+                    Method f = msn.getDeclaredMethod("f", android.content.Context.class);
+                    f.setAccessible(true);
+                    hook(f).intercept(chain -> {
+                        Object r = chain.proceed();
+                        if (r instanceof Integer) {
+                            int span = (Integer) r;
+                            int tag = screenTag(cl);
+                            // 只在「屏幕/列数」真的变化时打一行，避免刷屏
+                            if (span != sLastSpan || tag != sSpanTag) {
+                                sLastSpan = span;
+                                sSpanTag = tag;
+                                log(Log.INFO, TAG, "SPAN screen="
+                                        + (tag == 1 ? "inner" : "outer")
+                                        + " scale=" + safeScale(cl)
+                                        + " spanCount=" + span);
+                            }
+                        }
+                        return r;
+                    });
+                    log(Log.INFO, TAG, "hooked ms.n.f(Context) for spanCount log");
+                } catch (Throwable t) {
+                    log(Log.WARN, TAG, "hook spanCount f() failed: " + t);
+                }
             } catch (Throwable t) {
                 log(Log.ERROR, TAG, "hook scale a() failed: " + t);
             }
         } catch (Throwable t) {
             log(Log.ERROR, TAG, "installSplitScreenScale failed: " + t);
+        }
+    }
+
+    /** 读取当前缓存的档位（只读静态字段 d，不触发 hook 递归）。 */
+    private static int safeScale(ClassLoader cl) {
+        try {
+            Class<?> c = sScaleClass;
+            if (c == null) {
+                c = findScaleClass(cl);
+            }
+            java.lang.reflect.Field fd = c.getDeclaredField("d");
+            fd.setAccessible(true);
+            return fd.getInt(null);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    // ==================== 换屏后重算信息流列数 ====================
+
+    /** 信息流用的 LayoutManager（弱引用，避免拖住 Activity）。 */
+    private static final java.util.List<java.lang.ref.WeakReference<Object>> sFeedLms =
+            new java.util.ArrayList<>();
+
+    private static void rememberLm(Object lm) {
+        if (lm == null) {
+            return;
+        }
+        String cn = lm.getClass().getName();
+        if (!cn.contains("GridLayoutManager") && !cn.contains("StaggeredGridLayoutManager")) {
+            return;
+        }
+        synchronized (sFeedLms) {
+            for (java.lang.ref.WeakReference<Object> ref : sFeedLms) {
+                if (ref.get() == lm) {
+                    return;
+                }
+            }
+            sFeedLms.add(new java.lang.ref.WeakReference<>(lm));
+        }
+    }
+
+    private void installFeedSpanForce(ClassLoader cl) {
+        // 记录所有被装到 RecyclerView 上的网格布局管理器
+        try {
+            Class<?> rv = Class.forName("androidx.recyclerview.widget.RecyclerView", false, cl);
+            Class<?> lmCls = Class.forName("androidx.recyclerview.widget.RecyclerView$LayoutManager", false, cl);
+            Method slm = rv.getDeclaredMethod("setLayoutManager", lmCls);
+            slm.setAccessible(true);
+            hook(slm).intercept(chain -> {
+                Object r = chain.proceed();
+                try {
+                    Object lm = chain.getThisObject();
+                    java.lang.reflect.Method getLm = rv.getDeclaredMethod("getLayoutManager");
+                    getLm.setAccessible(true);
+                    Object cur = getLm.invoke(lm);
+                    rememberLm(cur);
+                } catch (Throwable ignored) {
+                }
+                return r;
+            });
+            log(Log.INFO, TAG, "hooked RecyclerView.setLayoutManager (feed span tracking)");
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "hook setLayoutManager failed: " + t);
+        }
+
+        // 兜底：setSpanCount 被调用时也记一下（有的列表不经过 setLayoutManager）
+        for (String cn : new String[]{
+                "androidx.recyclerview.widget.GridLayoutManager",
+                "androidx.recyclerview.widget.StaggeredGridLayoutManager"}) {
+            try {
+                Class<?> c = Class.forName(cn, false, cl);
+                Method m = c.getDeclaredMethod("setSpanCount", int.class);
+                m.setAccessible(true);
+                hook(m).intercept(chain -> {
+                    rememberLm(chain.getThisObject());
+                    return chain.proceed();
+                });
+                log(Log.INFO, TAG, "hooked " + cn + ".setSpanCount");
+            } catch (Throwable t) {
+                log(Log.INFO, TAG, "skip " + cn + ": " + t);
+            }
+        }
+    }
+
+    /** 当前屏「应有」的列数：直接借小红书自己的 e(屏宽px) 算，不自己编映射。 */
+    private static int desiredSpan(ClassLoader cl) {
+        try {
+            Class<?> msn = findScaleClass(cl);
+            Object inst = msn.getField("a").get(null);
+            Method e = msn.getDeclaredMethod("e", int.class);
+            e.setAccessible(true);
+            Object v = e.invoke(inst, currentShortSidePx());
+            return v instanceof Integer ? (Integer) v : -1;
+        } catch (Throwable t) {
+            XposedModule m = sModule;
+            if (m != null) {
+                m.log(Log.WARN, TAG, "desiredSpan failed: " + t);
+            }
+            return -1;
+        }
+    }
+
+    /**
+     * 换屏后调用：把记下来的网格 LayoutManager 的列数改成当前屏应有的值。
+     * 延迟 400ms，等新窗口布局完成后再改，避免和正在进行的测量打架。
+     */
+    private static void applyFeedSpan(final ClassLoader cl, String why) {
+        if (!sSpanForce) {
+            return;
+        }
+        try {
+            final int want = desiredSpan(cl);
+            if (want <= 0) {
+                return;
+            }
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+                int changed = 0;
+                synchronized (sFeedLms) {
+                    for (java.util.Iterator<java.lang.ref.WeakReference<Object>> it =
+                         sFeedLms.iterator(); it.hasNext(); ) {
+                        Object lm = it.next().get();
+                        if (lm == null) {
+                            it.remove();
+                            continue;
+                        }
+                        try {
+                            Method get = lm.getClass().getMethod("getSpanCount");
+                            int cur = (Integer) get.invoke(lm);
+                            if (cur == want) {
+                                continue;
+                            }
+                            Method set = lm.getClass().getMethod("setSpanCount", int.class);
+                            set.invoke(lm, want);
+                            changed++;
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+                XposedModule m = sModule;
+                if (m != null && changed > 0) {
+                    m.log(Log.INFO, TAG, "SPAN forced " + changed + " list(s) -> " + want
+                            + " (" + why + ")");
+                }
+            }, 400L);
+        } catch (Throwable t) {
+            XposedModule m = sModule;
+            if (m != null) {
+                m.log(Log.WARN, TAG, "applyFeedSpan failed: " + t);
+            }
         }
     }
 

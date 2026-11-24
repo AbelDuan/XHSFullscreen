@@ -17,6 +17,13 @@ LSPosed 模块,让**小红书 (com.xingin.xhs)** 在折叠屏内屏的笔记**�
 > **⚠️ 升级方式变了**:v2 起必须 `pm install -r` 覆盖安装(不要再用 `cp` 覆盖
 > `base.apk`),然后重启目标 App。原因见「安装」一节。
 
+> **v2.1.1 修复:内外屏列数强制同步** —— 换屏后小红书**根本不会重算 spanCount**
+> (列表继续用上一个屏算出来的列数),而且模块的 `hookActivityLifecycle()` 只定义、
+> 从没被调用过,换屏时拿不到新屏尺寸。两处都修了,详见「列数为什么会同步」。
+>
+> **v2.1.1 修复:详情页图片顶出下边缘、标题被切** —— 可用高度里补上了标题块的预留
+> (`title`, 默认 150px)。
+
 ## 问题原因
 
 在自定义密度(如 density=345 + 字体 125%)的折叠屏上,小红书笔记详情页左右留有大片空白。
@@ -106,6 +113,56 @@ am force-stop com.xingin.xhs   # 改完重启目标 App 即生效
 ```bash
 logcat -d | grep XHSFullscreen | grep FIT
 # FIT gallery -> 1124x1124 ratio=1.0 avail=1124x1420
+```
+
+---
+
+## 列数为什么会同步(v2.1.1)
+
+### 链路(9.55.0 字节码)
+
+```
+f(Context)                              ← 真正的 spanCount
+  ├ b(静态布尔:是否平板/横向折叠) 为真才往下走
+  ├ c(Lazy<Boolean>) 为真 → e(屏宽px) 按 280/480/680/960dp 分档
+  └ 再用 a() 读到的缩放档位在该档里选列数
+m(I,F)  →  d = g(...);  h.u("screen_scale_sp_key", d)     单一个 key
+a()     →  if (b) return d; else return NORMAL             只在 b 为真时看 d
+```
+
+配置文件里的实测映射(外屏 1168px = SMALL 档):`scale=2 → 2 列`、`scale=1 → 3 列`、
+`scale=0 → 4 列`。
+
+### 两个真因
+
+1. **换屏后小红书不重算**:切屏时 `f(Context)` 根本不会被再调一次,RecyclerView 的
+   GridLayoutManager 继续用上一个屏的 spanCount —— 现象就是「两块屏列数强制同步」。
+   日志证据:内屏期间完全没有 `SPAN screen=inner` 行。
+2. **模块没接上换屏时机**:`hookActivityLifecycle()` 只定义、从来没被调用,
+   `onResume`/`onConfigurationChanged` 的 hook 全没装上,`refreshScreenShort()`
+   也就没跑过;而 `Application`/`Resources.getSystem()` 的 DisplayMetrics 在折叠换屏后
+   不一定刷新,内屏会被判成 `outer`,于是两边读写同一个 key。
+
+### 修法
+
+- `onPackageLoaded` 里真正调用 `hookActivityLifecycle()`;
+  `onResume` / `onConfigurationChanged` 里用 **Activity 自己的 DisplayMetrics**
+  记录当前屏短边(`refreshScreenShort`);
+- 换屏时(`onConfigurationChanged` 与 `a()` 里 tag 变化两处)调用 `applyFeedSpan()`:
+  用小红书自己的 `ms.n.e(当前屏宽px)` 算出「这一屏应该几列」,再对记录下来的
+  GridLayoutManager / StaggeredGridLayoutManager 调 `setSpanCount()`,延迟 400ms
+  等新窗口布局完成后再改。
+- 列数的映射完全不自己编,一律借 `e(int)`。
+
+日志:
+
+```bash
+logcat -d | grep XHSFullscreen | grep -E "screen short side|screenTag|SPAN"
+# screen short side -> 1168 (1168x1712)
+# screenTag -> outer shortSide=1168 divider=1420
+# switch screen -> reload scale, tag=outer value=2
+# SPAN screen=outer scale=2 spanCount=2
+# SPAN forced 1 list(s) -> 4 (onConfigurationChanged)
 ```
 
 ---

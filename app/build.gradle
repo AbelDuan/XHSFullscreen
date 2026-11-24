@@ -6,8 +6,8 @@ android {
         applicationId "com.abel.xhsfullscreen"
         minSdkVersion 27
         targetSdkVersion 36
-        versionCode 16
-        versionName "2.0.1"
+        versionCode 23
+        versionName "2.1.1"
         // 必须单 dex：见 gradle.properties 说明
         multiDexEnabled false
     }
