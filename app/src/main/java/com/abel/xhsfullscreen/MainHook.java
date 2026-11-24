@@ -120,11 +120,45 @@ public class MainHook extends XposedModule {
             "com.xingin.comment.consumer.list.CommentListView",
             "com.xingin.matrix.notedetail.imagecontent.imageinfo.AsyncImageInfoView",
             "com.xingin.matrix.notedetail.notecontent.NoteDetailContentView",
+            // 图片展示区（图片画廊的父容器）。9.55 起图片卡片的宽高由它的子类
+            // ImageGalleryView 用显式像素 LayoutParams 定死，这才是「图片变小」的源头。
+            "com.xingin.matrix.notedetail.imagecontent.imagedisplay.AsyncImageDisplayView",
     };
+
+    /** 图片画廊的类名特征（宽度被写死的就是它）。 */
+    private static final String GALLERY_CLASS_HINT = "ImageGalleryView";
 
     // 逐帧观测开关：记录每帧绘制时 padding 的真实值，用于验证
     // 「打开帖子前边距就已定好」。定稿后可关掉。
     private static final boolean VERBOSE = false;
+
+    // 视图层级诊断开关：把详情页整棵树的 类名/宽高/内边距/LayoutParams 打进
+    // logcat，用来定位「这一版图片为什么变小、到底窄在哪一层」。
+    // 只在定位阶段打开（打开后每 4 秒最多 dump 一次，单次不超过 DUMP_MAX_LINES 行）。
+    private static final boolean DEBUG_TREE = false;
+    private static final int DUMP_MAX_LINES = 400;
+
+    // ==================== 运行期开关（免重编调查参数） ====================
+    //
+    // LSPosed 在开机时把模块 dex 读进内存，之后换 APK 必须软重启才会生效。
+    // 为了不因为「调 30px 还是 22px 边距」这种小事反复重启，这几个参数改成
+    // 从配置文件读：改文件 → am force-stop com.xingin.xhs → 重开即生效。
+    //
+    //   tree=1        打印详情页视图树（定位用）
+    //   fill=1        把详情页图片区强制撑到满宽（本次新增功能）
+    //   pad=45        内容区左右内边距（px）
+    //   margin=22     图片区左右留白（px），fill 生效时的目标边距
+    //
+    // 文件不存在时用下面的默认值，与硬编码行为一致。
+    private static final String CONF_PATH = "/data/local/tmp/xhsfullscreen.conf";
+
+    private static volatile boolean sTree = DEBUG_TREE;
+    private static volatile boolean sFill = true;
+    private static volatile int sMargin = 22;
+    private static volatile int sPad = PAD_TARGET;
+    // 底部预留：评论输入条是「浮在内容上」的（不是布局的一部分），
+    // 所以滚动视口一直延伸到屏幕最底。图片要「不出屏」，就得把这条的高度让出来。
+    private static volatile int sBottom = 110;
 
     // 对照实验开关：true = 只观测不改布局。
     //
@@ -149,8 +183,9 @@ public class MainHook extends XposedModule {
         if (!XHS.equals(param.getPackageName())) {
             return;
         }
-        log(Log.INFO, TAG, "hooked into XHS, installing hooks (v3)");
+        log(Log.INFO, TAG, "hooked into XHS, installing hooks (v1.9.0)");
         sModule = this;
+        loadConf();
 
         // ★ 主动预注册：不等实例出现，直接用全限定名把目标类的 setter hook 好。
         //
@@ -203,7 +238,11 @@ public class MainHook extends XposedModule {
                 });
                 log(Log.INFO, TAG, "hooked wj9.c0.y0 (source-level normalize)");
             } catch (Throwable t) {
-                log(Log.ERROR, TAG, "hook wj9.c0.y0 failed: " + t);
+                // 这个方法名属于 9.50~9.54 的混淆名，9.55.0 已经不叫这个名字
+                // （NoSuchMethodException）。它是「提速」而不是「必需」：
+                // 真正保证首帧正确的还是 setter 预注册 + PreDraw 守卫，
+                // 所以这里降级为 INFO，不再当错误刷日志。
+                log(Log.INFO, TAG, "wj9.c0.y0 not present in this version: " + t);
             }
         }
 
@@ -319,7 +358,8 @@ public class MainHook extends XposedModule {
     private static boolean isTarget(String cn) {
         return cn.contains("CommentListView")
                 || cn.contains("AsyncImageInfoView")
-                || cn.contains("NoteDetailContentView");
+                || cn.contains("NoteDetailContentView")
+                || cn.contains("AsyncImageDisplayView");
     }
 
     /**
@@ -411,7 +451,7 @@ public class MainHook extends XposedModule {
                     // 不再要求 l == r 且 >= PAD_THRESHOLD —— 小红书偶尔会写
                     // 不对称值或小于阈值的值，旧条件放行后边距就再也拉不回来，
                     // 表现为「偶发某条帖子的评论区宽度不对」。
-                    int want = isOuterContainer(cn) ? 0 : PAD_TARGET;
+                    int want = isOuterContainer(cn) ? 0 : sPad;
                     if (l != want || r != want) {
                         // 复制后改写：chain.getArgs() 不保证可变，
                         // 原地 set 在个别通道会抛 UnsupportedOperationException。
@@ -587,11 +627,252 @@ public class MainHook extends XposedModule {
         try {
             String cn = v.getClass().getName();
             int want = isOuterContainer(cn) ? 0
-                    : (needsGutter(cn) ? PAD_TARGET : v.getPaddingLeft());
+                    : (needsGutter(cn) ? sPad : v.getPaddingLeft());
             int l = v.getPaddingLeft();
             int r = v.getPaddingRight();
             if (l != want || r != want) {
                 v.setPadding(want, v.getPaddingTop(), want, v.getPaddingBottom());
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    // ==================== 视图层级诊断（DEBUG_TREE） ====================
+
+    private static volatile long sLastTreeDump = 0L;
+
+    /**
+     * 把整棵视图树打出来：每行的含义
+     *   类名 w=宽 h=高 pl/pr=左右内边距 lp=LayoutParams 的宽x高
+     *   ImageView 追加 st=scaleType dw/dh=图片固有尺寸
+     *
+     * 找一个「图片比预期小」的问题，唯一可靠的办法就是看实际数字：
+     * 是容器被限宽、是 padding 吃掉了宽度、还是图片本身按比例缩了。
+     */
+    private static void dumpTreeIfDue(View v, String why) {
+        if (!sTree) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - sLastTreeDump < 4000L) {
+            return;
+        }
+        sLastTreeDump = now;
+        XposedModule m = sModule;
+        if (m == null) {
+            return;
+        }
+        try {
+            View root = v.getRootView();
+            int[] lines = new int[]{0};
+            m.log(Log.INFO, TAG, "TREE " + why
+                    + " screenShort=" + currentShortSidePx()
+                    + " v=" + v.getWidth() + "x" + v.getHeight());
+            dumpNode(root, 0, m, lines);
+            m.log(Log.INFO, TAG, "TREE end lines=" + lines[0]);
+        } catch (Throwable t) {
+            m.log(Log.WARN, TAG, "dumpTree failed: " + t);
+        }
+    }
+
+    /**
+     * 详情页图片区尺寸重算（本次新增功能）。
+     *
+     * 取证结论（v1.9 外屏 1168×1712 实测视图树）：
+     *   AsyncImageDisplayView  w=1168 h=1012        ← 满宽，正常
+     *     ImageGalleryView     w=759  h=1012  lp=759x1012   ← ★ 宽度被写死成 759
+     *       MatrixHorizontalRecyclerView / AsyncPhotoNoteItemView 也都是 759
+     *
+     * 也就是说图片变小**不是**内边距问题（那里已经是 0），而是小红书按图片比例
+     * 先把高度定成 1012（高度的上限），再用宽高比 759/1012=0.75 反推出宽度。
+     * 高度上限一变，宽度就跟着缩水 —— 这就是「比之前小很多」的机制。
+     *
+     * 修法：不去猜它的上限，直接按「能放多大放多大、但不出屏」重算：
+     *   可用宽 = 展示区宽 - 2 * margin
+     *   可用高 = 滚动视口高 - 2 * margin
+     *   宽高比沿用小红书自己算出来的（lp.width / lp.height，就是这么来的）
+     *   先按满宽算高；高超过可用高就按可用高回算宽。
+     * 这样竖图会顶到「一屏放得下的最大尺寸」，横图则铺满宽度，两边都留 margin。
+     */
+    private static volatile long sLastFitLog = 0L;
+
+    /**
+     * 在图片展示区里找到图片画廊并重算尺寸。
+     * 画廊不是 display 的直接子节点（层级是 display → LinearLayout → ImageGalleryView），
+     * 所以这里按类名下潜找，最多 3 层。
+     */
+    private static void fitGallery(View display) {
+        if (!sFill || !(display instanceof ViewGroup)) {
+            return;
+        }
+        try {
+            fitGalleryIn((ViewGroup) display, display, 0);
+        } catch (Throwable t) {
+            XposedModule m = sModule;
+            if (m != null) {
+                m.log(Log.WARN, TAG, "FIT failed: " + t);
+            }
+        }
+    }
+
+    private static void fitGalleryIn(ViewGroup parent, View display, int depth) {
+        if (depth > 3) {
+            return;
+        }
+        int n = parent.getChildCount();
+        for (int i = 0; i < n; i++) {
+            View c = parent.getChildAt(i);
+            if (c == null) {
+                continue;
+            }
+            if (c.getClass().getName().contains(GALLERY_CLASS_HINT)) {
+                fitOneGallery(c, display);
+            } else if (c instanceof ViewGroup && c.getVisibility() == View.VISIBLE) {
+                fitGalleryIn((ViewGroup) c, display, depth + 1);
+            }
+        }
+    }
+
+    /** 缓存在 View 上的自适应结果 {w, h, 屏幕短边, 原生宽高比*10000}。 */
+    private static final int TAG_FIT = 0x584853_46;   // 'XHSF'
+
+    private static void fitOneGallery(View gal, View display) {
+        ViewGroup.LayoutParams lp = gal.getLayoutParams();
+        if (lp == null) {
+            return;
+        }
+        int shortSide = currentShortSidePx();
+        Object cached = gal.getTag(TAG_FIT);
+        int[] box = cached instanceof int[] ? (int[]) cached : null;
+
+        float ratio;                     // 宽 / 高
+        if (box != null && lp.width == box[0] && lp.height == box[1]) {
+            // lp 还停在我们自己写进去的那一对 → 这是同一张图，沿用最初的原生比例。
+            if (box[2] == shortSide) {
+                return;                  // 屏没变、尺寸已是目标值，什么都不做
+            }
+            ratio = box[3] / 10000f;
+        } else if (lp.width > 0 && lp.height > 0) {
+            // 小红书按图片原生比例算出的宽高（这就是比例的来源）
+            ratio = (float) lp.width / (float) lp.height;
+        } else if (gal.getWidth() > 0 && gal.getHeight() > 0) {
+            ratio = (float) gal.getWidth() / (float) gal.getHeight();
+        } else {
+            return;
+        }
+        if (ratio <= 0.05f || ratio > 20f) {
+            return;
+        }
+
+        int margin = sMargin;
+        int availW = display.getWidth() - margin * 2;
+        int availH = availableHeight(gal) - sBottom - margin * 2;
+        if (availW <= 0 || availH <= 0) {
+            return;
+        }
+        int w = availW;
+        int h = Math.round(w / ratio);
+        if (h > availH) {
+            h = availH;
+            w = Math.round(h * ratio);
+        }
+        gal.setTag(TAG_FIT, new int[]{w, h, shortSide, Math.round(ratio * 10000f)});
+        if (lp.width == w && lp.height == h) {
+            return;
+        }
+        lp.width = w;
+        lp.height = h;
+        gal.setLayoutParams(lp);
+        XposedModule m = sModule;
+        if (m != null) {
+            m.log(Log.INFO, TAG, "FIT gallery -> " + w + "x" + h
+                    + " ratio=" + ratio + " avail=" + availW + "x" + availH);
+        }
+    }
+
+    /**
+     * 这张图片实际能占的高度：从图片当前位置到可滚动视口的底边。
+     *
+     * 之前用「滚动容器总高」当上限，比真实可用空间多了「图片顶到视口顶」的那段
+     * （外屏实测多出 135px），竖图就顶出了屏幕。改成按屏幕坐标算：
+     *   视口底边 = 最近 NestedScrollLayout 祖先的 bottom（屏幕坐标）
+     *   可用高   = 视口底边 - 图片当前 top（屏幕坐标）
+     * 结果只在「比例变化 / 换屏」时重算并缓存在 View 上，
+     * 滚动过程中不会因为 top 变化而反复改尺寸。
+     */
+    private static int availableHeight(View gal) {
+        try {
+            int[] loc = new int[2];
+            gal.getLocationOnScreen(loc);
+            int bottom = viewportBottom(gal);
+            int h = bottom - loc[1];
+            if (h > 0) {
+                return h;
+            }
+        } catch (Throwable ignored) {
+        }
+        android.content.Context ctx = currentContext();
+        if (ctx != null) {
+            android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+            return (int) (dm.heightPixels * 0.80f);
+        }
+        return 0;
+    }
+
+    private static int viewportBottom(View from) {
+        View v = from;
+        for (int i = 0; i < 8 && v != null; i++) {
+            if (v.getClass().getName().contains("NestedScrollLayout") && v.getHeight() > 0) {
+                int[] loc = new int[2];
+                v.getLocationOnScreen(loc);
+                return loc[1] + v.getHeight();
+            }
+            v = v.getParent() instanceof View ? (View) v.getParent() : null;
+        }
+        android.content.Context ctx = currentContext();
+        if (ctx != null) {
+            android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+            return dm.heightPixels - 130;
+        }
+        return 0;
+    }
+
+    private static void dumpNode(View v, int depth, XposedModule m, int[] lines) {
+        if (v == null || depth > 16 || lines[0] >= DUMP_MAX_LINES) {
+            return;
+        }
+        try {
+            StringBuilder sb = new StringBuilder(96);
+            for (int i = 0; i < depth; i++) {
+                sb.append(' ');
+            }
+            sb.append(v.getClass().getSimpleName())
+              .append(" w=").append(v.getWidth())
+              .append(" h=").append(v.getHeight())
+              .append(" pl=").append(v.getPaddingLeft())
+              .append(" pr=").append(v.getPaddingRight());
+            ViewGroup.LayoutParams lp = v.getLayoutParams();
+            if (lp != null) {
+                sb.append(" lp=").append(lp.width).append('x').append(lp.height);
+            }
+            if (v instanceof android.widget.ImageView) {
+                android.widget.ImageView iv = (android.widget.ImageView) v;
+                android.graphics.drawable.Drawable d = iv.getDrawable();
+                sb.append(" st=").append(iv.getScaleType())
+                  .append(" dw=").append(d == null ? -1 : d.getIntrinsicWidth())
+                  .append(" dh=").append(d == null ? -1 : d.getIntrinsicHeight());
+            }
+            if (v.getVisibility() != View.VISIBLE) {
+                sb.append(" vis=").append(v.getVisibility());
+            }
+            m.log(Log.INFO, TAG, sb.toString());
+            lines[0]++;
+            if (v instanceof ViewGroup) {
+                ViewGroup vg = (ViewGroup) v;
+                int n = vg.getChildCount();
+                for (int i = 0; i < n && lines[0] < DUMP_MAX_LINES; i++) {
+                    dumpNode(vg.getChildAt(i), depth + 1, m, lines);
+                }
             }
         } catch (Throwable ignored) {
         }
@@ -617,7 +898,8 @@ public class MainHook extends XposedModule {
             final String cn = v.getClass().getName();
             final boolean outer = isOuterContainer(cn);
             final boolean gutter = needsGutter(cn);
-            final int want = outer ? 0 : (gutter ? PAD_TARGET : -1);
+            final boolean display = cn.contains("AsyncImageDisplayView");
+            final int want = outer ? 0 : (gutter ? sPad : -1);
             final ViewTreeObserver.OnPreDrawListener l =
                     new ViewTreeObserver.OnPreDrawListener() {
                 private int frame = 0;
@@ -635,6 +917,14 @@ public class MainHook extends XposedModule {
                                 v.setPadding(want, v.getPaddingTop(),
                                         want, v.getPaddingBottom());
                             }
+                        }
+
+                        // 诊断：只在外层容器绘制前 dump 一次整棵树，避免多份重复。
+                        if (sTree && outer) {
+                            dumpTreeIfDue(v, "detail");
+                        }
+                        if (sFill && display) {
+                            fitGallery(v);
                         }
 
                         if (VERBOSE && frame < 20) {
@@ -690,7 +980,14 @@ public class MainHook extends XposedModule {
     private static volatile Class<?> sStoreClass = null;
 
     /** 候选类名缓存：已知的混淆名，按优先级尝试，命中即用。 */
-    private static final String[] STORE_HINTS = {"q3e.h", "s3e.h", "r3e.h", "t3e.h"};
+    /**
+     * 已知的混淆名，命中即用；未命中再按特征扫描。
+     *
+     * 9.50~9.54 是 q3e.h / s3e.h，9.55.0 换成 p7e.h（classes14.dex）。
+     * 名字每次大版本都可能变，写在这里只是为了「快」——真正的兜底是
+     * scanDexForStore 的结构匹配（静态 g() 返回自身 + j(String,int)I + u(String,int)V）。
+     */
+    private static final String[] STORE_HINTS = {"p7e.h", "q3e.h", "s3e.h", "r3e.h", "t3e.h"};
 
     /**
      * 找到小红书的键值存储封装类。
@@ -879,14 +1176,31 @@ public class MainHook extends XposedModule {
                 entries.setAccessible(true);
                 java.util.Enumeration<?> en = (java.util.Enumeration<?>) entries.invoke(dexFile);
                 while (en.hasMoreElements()) {
-                    String name = String.valueOf(en.nextElement());
-                    if (name.startsWith("Ljava/") || name.startsWith("Lkotlin/")) {
-                        continue;
-                    }
-                    String cn = name.substring(1, name.length() - 1).replace('/', '.');
                     try {
-                        out.add(Class.forName(cn, false, cl));
+                        String name = String.valueOf(en.nextElement());
+                        // 描述符形如 "La/b/C;"。9.55.0 的部分 dex 里混进了长度不足 3 的
+                        // 条目（如 "L"），substring(1, len-1) 会抛
+                        // StringIndexOutOfBoundsException: begin 1, end 0 —— 这个异常
+                        // 在循环里没有兜住，直接把整个遍历打断，后面所有 dex 的类都没被
+                        // 检查过，于是「按特征扫描」永远找不到存储类。
+                        // 两处都要修：短条目跳过 + 单条目异常不外溢。
+                        if (name.length() < 3 || name.charAt(0) != 'L' || !name.endsWith(";")) {
+                            continue;
+                        }
+                        if (name.startsWith("Ljava/") || name.startsWith("Lkotlin/")
+                                || name.startsWith("Landroid/") || name.startsWith("Landroidx/")) {
+                            continue;
+                        }
+                        String cn = name.substring(1, name.length() - 1).replace('/', '.');
+                        if (cn.indexOf('$') >= 0) {
+                            continue;
+                        }
+                        try {
+                            out.add(Class.forName(cn, false, cl));
+                        } catch (Throwable ignored) {
+                        }
                     } catch (Throwable ignored) {
+                        // 单个条目的任何异常都不能中断整轮扫描。
                     }
                 }
             }
@@ -943,9 +1257,27 @@ public class MainHook extends XposedModule {
         try {
             Class<?> h = findStoreClass(cl);
             Object inst = h.getMethod("g").invoke(null);
-            java.lang.reflect.Field fc = h.getDeclaredField("e");
-            fc.setAccessible(true);
-            android.content.Context ctx = (android.content.Context) fc.get(inst);
+            // Context 字段：9.54 是实例字段 e，9.55.0 改成了 **静态** 字段
+            //   public static e Landroid/content/Context;
+            // 静态字段取值时 target 必须是 null，传实例会抛
+            // IllegalArgumentException，整个 divider 失败 → 分界值恒为 0 →
+            // screenTag 恒判定为「外屏」→ 内外屏档位又合并成一份。
+            android.content.Context ctx = null;
+            try {
+                java.lang.reflect.Field fc = h.getDeclaredField("e");
+                fc.setAccessible(true);
+                Object target = java.lang.reflect.Modifier.isStatic(fc.getModifiers()) ? null : inst;
+                ctx = (android.content.Context) fc.get(target);
+            } catch (Throwable t0) {
+                XposedModule mod0 = sModule;
+                if (mod0 != null) mod0.log(Log.WARN, TAG, "store context field failed: " + t0);
+            }
+            if (ctx == null) {
+                ctx = currentContext();
+            }
+            if (ctx == null) {
+                return 0;
+            }
 
             android.hardware.display.DisplayManager dm =
                     (android.hardware.display.DisplayManager)
@@ -990,11 +1322,101 @@ public class MainHook extends XposedModule {
      * @return 1 = 内屏，0 = 外屏
      */
     private static int screenTag(ClassLoader cl) {
-        android.util.DisplayMetrics dm =
-                android.content.res.Resources.getSystem().getDisplayMetrics();
-        int shortSide = Math.min(dm.widthPixels, dm.heightPixels);
+        int shortSide = currentShortSidePx();
         int divider = divider(cl);
         return divider > 0 && shortSide >= divider ? 1 : 0;
+    }
+
+    /**
+     * 当前所在一屏的短边像素。
+     *
+     * 优先用「当前进程的 Resources」的 DisplayMetrics —— 折叠屏换屏时系统会刷新
+     * 应用的 Configuration，这个值跟着当前 Display 走。Resources.getSystem() 拿到的是
+     * 系统资源的度量，在部分 ROM 上不随换屏刷新，会一直停在主屏（内屏）的尺寸，
+     * 那样切到外屏也判成内屏。两级都有兜底，都是为了得到「当前屏」而不是「开机那屏」。
+     */
+    private static int currentShortSidePx() {
+        android.content.Context ctx = currentContext();
+        if (ctx != null) {
+            try {
+                android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+                if (dm != null && dm.widthPixels > 0) {
+                    return Math.min(dm.widthPixels, dm.heightPixels);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        android.util.DisplayMetrics sys =
+                android.content.res.Resources.getSystem().getDisplayMetrics();
+        return Math.min(sys.widthPixels, sys.heightPixels);
+    }
+
+    /** 读 /data/local/tmp/xhsfullscreen.conf（key=value，一行一条，缺项用默认值）。 */
+    private void loadConf() {
+        try {
+            java.io.File f = new java.io.File(CONF_PATH);
+            if (!f.exists()) {
+                log(Log.INFO, TAG, "conf absent, defaults tree=" + sTree + " fill=" + sFill
+                        + " pad=" + sPad + " margin=" + sMargin);
+                return;
+            }
+            java.util.Properties p = new java.util.Properties();
+            java.io.FileInputStream in = new java.io.FileInputStream(f);
+            try {
+                p.load(in);
+            } finally {
+                in.close();
+            }
+            sTree = boolConf(p, "tree", DEBUG_TREE);
+            sFill = boolConf(p, "fill", true);
+            sPad = intConf(p, "pad", PAD_TARGET);
+            sMargin = intConf(p, "margin", 22);
+            sBottom = intConf(p, "bottom", 110);
+            log(Log.INFO, TAG, "conf tree=" + sTree + " fill=" + sFill
+                    + " pad=" + sPad + " margin=" + sMargin);
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "loadConf failed: " + t);
+        }
+    }
+
+    private static boolean boolConf(java.util.Properties p, String k, boolean def) {
+        String v = p.getProperty(k);
+        if (v == null) {
+            return def;
+        }
+        v = v.trim();
+        return "1".equals(v) || "true".equalsIgnoreCase(v);
+    }
+
+    private static int intConf(java.util.Properties p, String k, int def) {
+        try {
+            String v = p.getProperty(k);
+            return v == null ? def : Integer.parseInt(v.trim());
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    /** 当前进程的 Application Context（模块启动时还没有 Activity）。 */
+    private static android.content.Context sAppContext = null;
+
+    private static android.content.Context currentContext() {
+        android.content.Context cached = sAppContext;
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            Class<?> at = Class.forName("android.app.ActivityThread");
+            java.lang.reflect.Method cur = at.getDeclaredMethod("currentApplication");
+            cur.setAccessible(true);
+            Object app = cur.invoke(null);
+            if (app instanceof android.content.Context) {
+                sAppContext = (android.content.Context) app;
+                return sAppContext;
+            }
+        } catch (Throwable ignored) {
+        }
+        return null;
     }
 
     /** 小红书原始的档位 key → 按屏区分后的 key。其它 key 原样返回。 */

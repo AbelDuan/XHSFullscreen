@@ -5,6 +5,18 @@ LSPosed 模块,让**小红书 (com.xingin.xhs)** 在折叠屏内屏的笔记**�
 > **v1.2 新增:内外屏「排数档位」独立记忆** —— 内屏和外屏各自记自己的手势缩放档位,
 > 互不影响。详见下方「内外屏排数档位独立记忆」一节。
 
+> **v2.0.1 新增:详情页图片按比例自适应放大** —— 图片区不再被小红书写死的宽高卡住,
+> 按图片原始宽高比把图放大到「一屏放得下、四周留 22px」的最大尺寸。详见下方
+> 「详情页图片自适应(v2.0)」。
+>
+> **v2.0.1 修复:小红书 9.55.0 起内外屏档位独立记忆失效** —— 存储类混淆名从
+> `s3e.h` 换成 `p7e.h`,且 Context 字段从实例字段变成**静态**字段;另外模块的
+> dex 遍历遇到短条目会抛 `StringIndexOutOfBoundsException`,把整轮扫描打断。
+> 三处都修了,详见「9.55.0 适配」。
+>
+> **⚠️ 升级方式变了**:v2 起必须 `pm install -r` 覆盖安装(不要再用 `cp` 覆盖
+> `base.apk`),然后重启目标 App。原因见「安装」一节。
+
 ## 问题原因
 
 在自定义密度(如 density=345 + 字体 125%)的折叠屏上,小红书笔记详情页左右留有大片空白。
@@ -37,6 +49,81 @@ LSPosed 模块,让**小红书 (com.xingin.xhs)** 在折叠屏内屏的笔记**�
 
 - 一级信息流、顶部栏、底部栏、视频评论区均不受影响,多列排版与正常布局保持不变。
 - **不会**修改系统 density、`smallestScreenWidthDp` 或任何全局设置。
+
+## 详情页图片自适应(v2.0)
+
+### 症状
+
+小红书 9.55 起,图文/视频详情页的图片比之前小了一大圈(外屏 1168 宽的屏上,
+图片卡片只有 752 宽,左右各空出 208px)。
+
+### 根因(视图树取证,外屏 1168×1712)
+
+```
+AsyncImageDisplayView  w=1168 h=1012                     ← 满宽,没问题
+  ImageGalleryView     w=759  h=1012  lp=759x1012        ← ★ 宽度被写死成 759
+    MatrixHorizontalRecyclerView / AsyncPhotoNoteItemView 也都是 759
+```
+
+不是 padding 问题(那里已经是 0),而是小红书**先把图片区高度定成上限 1012,
+再用图片宽高比 759/1012=0.75 反推出宽度**。高度上限一变,宽度跟着缩水 ——
+这就是「图片变小」的机制。
+
+### 做法
+
+不去猜它的上限,直接按「一屏放得下、四周留一点边距」重算:
+
+```
+可用宽 = 展示区宽 - 2 × margin
+可用高 = (滚动视口底边 - 图片当前 top) - bottom - 2 × margin
+宽高比 = 沿用小红书自己算的 lp.width / lp.height
+先按满宽算高;高超过可用高就按可用高回算宽
+```
+
+- `margin` 默认 22px(约 8dp),`bottom` 默认 110px —— 底部评论输入条是**浮在内容上**
+  的,滚动视口一直到屏幕最底,不让出这 110px 竖图就会钻到输入条下面(这就是
+  v2.0.0 「有一部分图片超过全屏」的原因)。
+- 结果缓存在 View 的 tag 上:**滚动时不重算**(否则 top 一变图就跟着伸缩),
+  只在「图片比例变化 / 换屏」时重算。
+- 方图会顶到满宽(1168 → 内容 1124),竖图受高度限制(width 由比值回算),
+  横图铺满宽度。都不会超出一屏。
+
+### 运行期调参(不用重编、不用重装)
+
+```bash
+# /data/local/tmp/xhsfullscreen.conf, key=value 一行一条
+fill=1        # 1=启用图片自适应, 0=关闭
+tree=0        # 1=打印详情页视图树(定位用)
+pad=45        # 内容区左右内边距(px)
+margin=22     # 图片四周留白(px)
+bottom=110    # 底部让给评论输入条的高度(px)
+
+am force-stop com.xingin.xhs   # 改完重启目标 App 即生效
+```
+
+### 日志
+
+```bash
+logcat -d | grep XHSFullscreen | grep FIT
+# FIT gallery -> 1124x1124 ratio=1.0 avail=1124x1420
+```
+
+---
+
+## 9.55.0 适配(内外屏档位独立记忆修复)
+
+小红书 9.55.0 换了一批混淆名,原来的实现有三处会失效:
+
+| # | 变化 | 后果 | 修法 |
+|---|---|---|---|
+| 1 | 存储封装类 `s3e.h` → `p7e.h` | 按名字快查全部落空,走特征扫描 | 提示表加 `p7e.h` |
+| 2 | dex 遍历里 `name.substring(1, len-1)` 遇到长度 1 的条目抛 `StringIndexOutOfBoundsException: begin 1, end 0` | 异常在循环里没兜住,**整轮扫描被打断**,特征扫描永远找不到类 | 短条目跳过 + 单条目异常不外溢 |
+| 3 | Context 字段 `e` 从**实例**字段变成 **`static`** 字段 | 静态字段取值时传实例会抛 `IllegalArgumentException` → 分界值恒为 0 → 内外屏被判成同一块 | 按 `Modifier.isStatic` 决定 target,并加了 ActivityThread 兜底 |
+
+另外 `screenTag()` 改成优先用**当前进程 Resources** 的 DisplayMetrics
+(`Resources.getSystem()` 在部分 ROM 上不随换屏刷新),分界值仍按两块屏的短边动态算。
+
+---
 
 ## 抖动问题(v2 修复)
 
@@ -230,38 +317,46 @@ v1.7.1 起,`build_dexswap.sh` 直接从 `app/build.gradle` 读取版本号,
 
 ## 安装
 
-### ⚠️ 用 `cp` 覆盖,不要反复 `pm install`
-
-LSPosed 把模块 APK 的**绝对路径**登记在 `/data/adb/lspd/config/modules_config.db` 的
-`apk_path` 字段,**首次收录后永不自动更新**。而 `pm install` **每次都会分配新的 codePath**,
-导致 `apk_path` 指向失效路径 —— 表现为「模块看着已启用,但代码根本没加载」,
-且**日志里一片空白**,极难排查。
-
-正确做法(路径不变,只需重启目标 App):
+### ✅ 正确姿势:`pm install -r` 覆盖安装 + 重启目标 App
 
 ```bash
-APK=$(pm path com.abel.xhsfullscreen | sed 's/package://')
-cp -f 新版本.apk "$APK" && chmod 644 "$APK"
-am force-stop com.xingin.xhs    # 唯一必需的生效动作
+cp 新版本.apk /data/local/tmp/xhs.apk
+pm install -r -d /data/local/tmp/xhs.apk
+dumpsys package com.abel.xhsfullscreen | grep versionName   # 确认版本真的变了
+am force-stop com.xingin.xhs                                 # 唯一必需的生效动作
 ```
 
-如果已经 `pm install` 导致路径漂移,改数据库即可(**只 cp 数据库文件,不要停 lspd**):
+要点:
 
-```python
-import sqlite3
-REAL = "/data/app/.../base.apk"   # pm path 的真实值
-db = sqlite3.connect("modules_config.db")
-db.execute("UPDATE modules SET apk_path=? WHERE module_pkg_name='com.abel.xhsfullscreen'", (REAL,))
-db.commit()
+- **必须确认版本号真的变了**。`pm install` 成功后 `PM` 立刻更新版本号;
+  如果还是旧版本,说明装的是旧包,别再往下试。
+- **重启目标 App 就够**,不用重启手机。模块代码在目标进程启动时加载。
+- `pm install` 会让 codePath 变成新的,但这不影响使用 —— lspd 会用
+  PackageManager 里的当前路径;旧路径失效只是历史遗留。
+
+### ❌ 不要再 `cp -f` 覆盖 `base.apk`
+
+v1.7 及更早的文档写的是「`cp` 覆盖 base.apk + force-stop」,这在 **9.55.0 上不生效**:
+`cp` 换了文件内容,但 PackageManager 的登记、ART 的 dex/vdex 产物仍是旧的,
+新进程拿到的还是旧代码 —— 现象是「改了代码、重启目标 App、日志里连新版本号都不出现」。
+实测:覆盖后删掉 `oat/arm64/base.{odex,vdex}` 也没用,只有 `pm install -r` 才真正刷新。
+
+排查是否加载了新代码,看这行日志里的版本串:
+
+```bash
+logcat -d | grep XHSFullscreen | grep "hooked into XHS"
+# hooked into XHS, installing hooks (v2.0.1)   ← 版本串对不上就是旧代码
 ```
 
-排查是否踩坑,比对三者是否一致:
+### 参考:LSPosed 登记的 apk_path 与 pm path 不一致时
 
 ```bash
 pm path com.abel.xhsfullscreen                           # 真实路径
-grep -ao "/data/app/[^/]*/com.abel.xhsfullscreen[^/]*/base.apk" \
+grep -ao "/data/app/[^/]*com.abel.xhsfullscreen[^/]*base.apk" \
      /data/adb/lspd/config/modules_config.db             # 登记路径
 ```
+
+两者不一致且模块确实加载失败时,改数据库(**只 cp 数据库文件,不要停 lspd**)。
 
 ### 激活
 
