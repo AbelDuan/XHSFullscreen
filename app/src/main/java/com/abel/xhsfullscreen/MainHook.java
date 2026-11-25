@@ -128,6 +128,14 @@ public class MainHook extends XposedModule {
     /** 图片画廊的类名特征（宽度被写死的就是它）。 */
     private static final String GALLERY_CLASS_HINT = "ImageGalleryView";
 
+    /** 画廊类的完整类名（dex 里查到的）。 */
+    private static final String GALLERY_FQN =
+            "com.xingin.matrix.notedetail.imagecontent.imagegallery.ImageGalleryView";
+
+    /** 图片展示区（画廊的容器，它的 onMeasure 是我们「测量前定尺寸」的入口）。 */
+    private static final String DISPLAY_CLASS =
+            "com.xingin.matrix.notedetail.imagecontent.imagedisplay.AsyncImageDisplayView";
+
     /**
      * 调试日志总开关（正式版 = false）。
      *
@@ -179,6 +187,107 @@ public class MainHook extends XposedModule {
     // 这就是「内外屏列数强制同步」的真正原因。
     private static volatile boolean sSpanForce = true;
 
+    // ===== 按「屏 + 方向」生效的四个组合 =====
+    //
+    // 组合名: inner_portrait / inner_landscape / outer_portrait / outer_landscape
+    // 任何参数都可以只对某一个组合单独覆盖,写法是 `键_组合名`,例如:
+    //     title=150                     ← 所有组合的默认值
+    //     title_outer_portrait=110      ← 只改外屏竖屏
+    //     fill_inner_landscape=0        ← 内屏横屏不做图片自适应
+    // 缺省:fill 只有竖屏开(横屏交还小红书),其余参数四个组合共用。
+    private static java.util.Properties sConf = new java.util.Properties();
+
+    // 当前组合实际生效的值(换屏/换向时重算一次,热路径只读字段)
+    private static volatile int fPad = PAD_TARGET;
+    private static volatile int fMargin = 22;
+    private static volatile int fBottom = 110;
+    private static volatile int fTitle = 150;
+    private static volatile boolean fFill = true;
+
+    /**
+     * 是否允许把小红书原本较小的图片放大。
+     *
+     * 默认 **false**：默认只做「收」——图片超出屏幕时才缩回屏幕内，本来就放得下的
+     * 一律不动。原因是小红书会在打开后把尺寸改回它自己的值（宽度上限 1086px），
+     * 我们一放大就必然出现一次可见的尺寸变化，而放大本身属于「锦上添花」。
+     * 想恢复放大：conf 里写 `enlarge=1`（可只对某个组合，如 enlarge_outer_portrait=1）。
+     */
+    private static volatile boolean fEnlarge = true;
+
+    /**
+     * 详情页图片尺寸适配总开关。
+     *
+     * 默认 **false**：v2.6.0 起默认完全不碰图片尺寸。原因是取证已经确认小红书在
+     * 图片打开后会把 LayoutParams 改回它自己的值（宽度上限 1086px），而它改写既不走
+     * View.setLayoutParams（全链路探针零命中）也不走 View.requestLayout（零命中），
+     * 显示层抢不回来，所以「放大」必然留下一次可见的尺寸变化。
+     *
+     * 关掉之后模块对图片尺寸是**完全不参与**：不写 lp、不跳过绘制帧，与没有这个模块
+     * 一样。需要放大时 conf 写 `fit=1`（可再配 `enlarge=1`）。
+     */
+    private static volatile boolean fFit = true;
+    private static volatile boolean fSpanForce = true;
+
+    private static String comboKey() {
+        boolean inner = sDivider > 0 ? sScreenShort >= sDivider : sScreenShort >= 1400;
+        return (inner ? "inner_" : "outer_") + (sPortrait ? "portrait" : "landscape");
+    }
+
+    /** 先找 `键_组合名`,没有再退回 `键`,最后用默认值。 */
+    private static String confValue(String key, String def) {
+        String combo = key;
+        try {
+            combo = key + "_" + comboKey();
+        } catch (Throwable ignored) {
+        }
+        String v = sConf.getProperty(combo);
+        if (v == null) {
+            v = sConf.getProperty(key);
+        }
+        return v == null ? def : v;
+    }
+
+    private static int confInt(String key, int def) {
+        try {
+            String v = confValue(key, null);
+            return v == null ? def : Integer.parseInt(v.trim());
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    private static boolean confBool(String key, boolean def) {
+        String v = confValue(key, null);
+        if (v == null) {
+            return def;
+        }
+        v = v.trim().toLowerCase(java.util.Locale.ROOT);
+        return v.equals("1") || v.equals("true") || v.equals("yes");
+    }
+
+    /** 换屏/换向或重读配置后,把当前组合的参数算好存到字段里。 */
+    private static void recomputeCombo() {
+        fPad = confInt("pad", PAD_TARGET);
+        fMargin = confInt("margin", 22);
+        fBottom = confInt("bottom", 110);
+        fTitle = confInt("title", 150);
+        // 横屏默认不接管图片尺寸(交还小红书):fill 只在竖屏默认开
+        fFill = confBool("fill", sPortrait);
+        fEnlarge = confBool("enlarge", true);
+        fFit = confBool("fit", true);
+        if (!fFit) {
+            // 总开关关掉时把 fill 也压掉：下面所有改写尺寸的分支都以 fFill 为前提，
+            // 于是这一版对图片尺寸是完全惰性的。
+            fFill = false;
+        }
+        XposedModule mCfg = sModule;
+        if (mCfg != null) {
+            mCfg.log(Log.INFO, TAG, "FIT mode: fit=" + fFit + " fill=" + fFill
+                    + " enlarge=" + fEnlarge + " (fit=0 表示完全不改图片尺寸)");
+        }
+        fSpanForce = confBool("spanforce", true);
+    }
+
     // 对照实验开关：true = 只观测不改布局。
     //
     // 2026-10-20 用它做过一次对照，结论（同一短正文帖子）：
@@ -214,6 +323,8 @@ public class MainHook extends XposedModule {
         // refreshScreenShort / scheduleFix 也就从来没跑过。
         // 折叠换屏时正是靠 onConfigurationChanged 才能拿到「新屏」的 DisplayMetrics。
         hookActivityLifecycle();
+        installMeasureFit(param.getDefaultClassLoader());
+        installGalleryLpHook(param.getDefaultClassLoader());
 
         // ★ 主动预注册：不等实例出现，直接用全限定名把目标类的 setter hook 好。
         //
@@ -504,7 +615,7 @@ public class MainHook extends XposedModule {
                     // 不再要求 l == r 且 >= PAD_THRESHOLD —— 小红书偶尔会写
                     // 不对称值或小于阈值的值，旧条件放行后边距就再也拉不回来，
                     // 表现为「偶发某条帖子的评论区宽度不对」。
-                    int want = isOuterContainer(cn) ? 0 : sPad;
+                    int want = isOuterContainer(cn) ? 0 : fPad;
                     if (l != want || r != want) {
                         // 复制后改写：chain.getArgs() 不保证可变，
                         // 原地 set 在个别通道会抛 UnsupportedOperationException。
@@ -550,19 +661,11 @@ public class MainHook extends XposedModule {
             // 一律以 Configuration 为准：Activity 的 DisplayMetrics 在
             // onConfigurationChanged 里可能还没刷新，会把横屏当竖屏，
             // 于是横屏也被强制成竖屏的列数（实测就是这样把横屏锁成 3 列的）。
+            // 只认 Configuration 这一份。曾经这里还用 DisplayMetrics 再写一遍，
+            // 两边的舍入差 1px(1671 vs 1672) 会让「屏变了」被反复判定成立：
+            // 每次 onResume 都重读档位、重算列数、重设 spanCount —— 这就是
+            // 进软件时列表闪一下的来源。
             updateFromConfig(a.getResources().getConfiguration());
-            int shortSide = Math.min(dm.widthPixels, dm.heightPixels);
-            sScreenWidth = dm.widthPixels;
-            if (shortSide != sScreenShort) {
-                sScreenShort = shortSide;
-                XposedModule m = sModule;
-                if (m != null) {
-                    if (sDebug) {
-                        m.log(Log.INFO, TAG, "screen short side -> " + shortSide
-                                + " (" + dm.widthPixels + "x" + dm.heightPixels + ")");
-                    }
-                }
-            }
         } catch (Throwable ignored) {
         }
     }
@@ -652,7 +755,7 @@ public class MainHook extends XposedModule {
         try {
             String cn = v.getClass().getName();
             int want = isOuterContainer(cn) ? 0
-                    : (needsGutter(cn) ? sPad : v.getPaddingLeft());
+                    : (needsGutter(cn) ? fPad : v.getPaddingLeft());
             int l = v.getPaddingLeft();
             int r = v.getPaddingRight();
             if (l != want || r != want) {
@@ -755,15 +858,113 @@ public class MainHook extends XposedModule {
     /** 第一次找到的画廊 View，缓存到展示区的 tag 上，避免每帧递归下潜。 */
     private static final int TAG_FIT_GAL = 0x584853_47;   // 'XHSG'
 
-    private static void fitGallery(View display) {
-        if (!sFill || !(display instanceof ViewGroup)) {
-            return;
+    /**
+     * 图片自适应只在竖屏做。
+     *
+     * 横屏如果也按「一屏放得下」算，可用高就是 1672 那条边，竖图的宽会被压到
+     * 800 多（屏幕宽 2364），看起来「突然变得很小」；而且换向时先按竖屏算一次、
+     * 再按横屏算一次，中间那一帧就是肉眼看到的闪。横屏一律把尺寸还给小红书自己。
+     */
+    /** 同 fitGallery，但返回「这一帧要不要先跳过」。 */
+    /**
+     * 是不是 Live Photo（实况/动态照片）。
+     *
+     * 这类帖子的小红书侧是一直在刷新的播放器，它每个布局周期都会重新给尺寸，
+     * 我们改写就会被无限改回去 —— 表现就是「严重闪烁」。
+     * 判断依据：画廊里的条目标签带 livephoto（dex 里存在
+     * NoteDetailLivePhotoItemPresenter / LocalLivePhotoPlayer / *LivePhotoItemView 这些类）。
+     */
+    private static boolean hasLivePhotoItem(View gal) {
+        try {
+            if (!(gal instanceof ViewGroup)) {
+                return false;
+            }
+            ViewGroup g = (ViewGroup) gal;
+            int n = g.getChildCount();
+            for (int i = 0; i < n; i++) {
+                View c = g.getChildAt(i);
+                if (c == null) {
+                    continue;
+                }
+                String cn = c.getClass().getName().toLowerCase(java.util.Locale.ROOT);
+                if (cn.contains("livephoto") || cn.contains("live_photo")) {
+                    return true;
+                }
+                if (c instanceof ViewGroup) {
+                    ViewGroup cc = (ViewGroup) c;
+                    for (int k = 0; k < cc.getChildCount(); k++) {
+                        View gc = cc.getChildAt(k);
+                        if (gc != null && gc.getClass().getName()
+                                .toLowerCase(java.util.Locale.ROOT).contains("livephoto")) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    /** 已判定为实况照片的画廊：从此完全不参与尺寸改写（tag 打在画廊上，跟着 View 走）。 */
+    private static final int TAG_LIVE = 0x58485348;
+
+    private static boolean isLiveGallery(View gal) {
+        return gal != null && gal.getTag(TAG_LIVE) != null;
+    }
+
+    private static boolean fitGalleryAndMaybeSkip(View display) {
+        if (!fFill || !(display instanceof ViewGroup)) {
+            return false;
         }
         try {
             Object cachedGal = display.getTag(TAG_FIT_GAL);
             if (cachedGal instanceof View) {
                 View gal = (View) cachedGal;
                 if (gal.getParent() != null) {
+                    if (isLiveGallery(gal)) {
+                        return false;             // 实况照片：已判定过，永久放行
+                    }
+                    if (hasLivePhotoItem(gal)) {
+                        gal.setTag(TAG_LIVE, Boolean.TRUE);
+                        releaseFit(display);      // 撤回我们可能写过的那一次
+                        return false;
+                    }
+                    return fitOneGallery(gal, display);
+                }
+                display.setTag(TAG_FIT_GAL, null);
+            }
+            fitGalleryIn((ViewGroup) display, display, 0);
+        } catch (Throwable t) {
+            XposedModule m = sModule;
+            if (m != null) {
+                m.log(Log.WARN, TAG, "FIT failed: " + t);
+            }
+        }
+        return false;
+    }
+
+    private static void fitGallery(View display) {
+        if (!fFill || !(display instanceof ViewGroup)) {
+            return;
+        }
+        try {
+            if (!isPortrait()) {
+                releaseFit(display);
+                return;
+            }
+            Object cachedGal = display.getTag(TAG_FIT_GAL);
+            if (cachedGal instanceof View) {
+                View gal = (View) cachedGal;
+                if (gal.getParent() != null) {
+                    if (isLiveGallery(gal)) {
+                        return;
+                    }
+                    if (hasLivePhotoItem(gal)) {
+                        gal.setTag(TAG_LIVE, Boolean.TRUE);
+                        releaseFit(display);
+                        return;
+                    }
                     fitOneGallery(gal, display);
                     return;
                 }
@@ -778,6 +979,28 @@ public class MainHook extends XposedModule {
         }
     }
 
+    /** 退回小红书自己的尺寸（横屏时用），只撤回我们自己写过的那一次。 */
+    private static void releaseFit(View display) {
+        Object cachedGal = display.getTag(TAG_FIT_GAL);
+        if (!(cachedGal instanceof View)) {
+            return;
+        }
+        View gal = (View) cachedGal;
+        Object cached = gal.getTag(TAG_FIT);
+        if (cached instanceof int[] && ((int[]) cached).length >= 7) {
+            int[] box = (int[]) cached;
+            ViewGroup.LayoutParams lp = gal.getLayoutParams();
+            if (lp != null && lp.width == box[0] && lp.height == box[1]
+                    && box[5] > 0 && box[6] > 0) {
+                lp.width = box[5];
+                lp.height = box[6];
+                gal.setLayoutParams(lp);
+            }
+        }
+        gal.setTag(TAG_FIT, null);
+        display.setTag(TAG_FIT_GAL, null);
+    }
+
     private static void fitGalleryIn(ViewGroup parent, View display, int depth) {
         if (depth > 3) {
             return;
@@ -789,6 +1012,13 @@ public class MainHook extends XposedModule {
                 continue;
             }
             if (c.getClass().getName().contains(GALLERY_CLASS_HINT)) {
+                if (isLiveGallery(c)) {
+                    continue;
+                }
+                if (hasLivePhotoItem(c)) {
+                    c.setTag(TAG_LIVE, Boolean.TRUE);
+                    continue;
+                }
                 display.setTag(TAG_FIT_GAL, c);
                 fitOneGallery(c, display);
             } else if (c instanceof ViewGroup && c.getVisibility() == View.VISIBLE) {
@@ -797,42 +1027,66 @@ public class MainHook extends XposedModule {
         }
     }
 
-    /** 缓存在 View 上的自适应结果 {w, h, 屏幕短边, 原生宽高比*10000}。 */
+    /**
+     * 缓存在画廊 View 上的自适应结果：
+     *   [0] 我们写进去的宽  [1] 高  [2] 屏短边  [3] 原始宽高比*10000
+     *   [4] 屏宽px        [5] 小红书原本的 lp.width  [6] 原本的 lp.height
+     */
     private static final int TAG_FIT = 0x584853_46;   // 'XHSF'
 
-    private static void fitOneGallery(View gal, View display) {
-        ViewGroup.LayoutParams lp = gal.getLayoutParams();
-        if (lp == null) {
-            return;
-        }
-        int shortSide = currentShortSidePx();
-        Object cached = gal.getTag(TAG_FIT);
-        int[] box = cached instanceof int[] ? (int[]) cached : null;
 
-        float ratio;                     // 宽 / 高
-        if (box != null && lp.width == box[0] && lp.height == box[1]) {
-            // lp 还停在我们自己写进去的那一对 → 这是同一张图，沿用最初的原生比例。
-            if (box[2] == shortSide) {
-                return;                  // 屏没变、尺寸已是目标值，什么都不做
+    /** 诊断用：只保留小红书自己的调用帧（framework / androidx 全丢掉，否则 10 条就被占满）。 */
+    private static String appStack() {
+        try {
+            StackTraceElement[] st = new Throwable().getStackTrace();
+            StringBuilder sb = new StringBuilder();
+            int n = 0;
+            for (StackTraceElement e : st) {
+                String c = e.getClassName();
+                if (!c.startsWith("com.xingin")) {
+                    continue;
+                }
+                sb.append("    ").append(c).append('.').append(e.getMethodName())
+                  .append(':').append(e.getLineNumber()).append('\n');
+                if (++n >= 12) {
+                    break;
+                }
             }
-            ratio = box[3] / 10000f;
-        } else if (lp.width > 0 && lp.height > 0) {
-            // 小红书按图片原生比例算出的宽高（这就是比例的来源）
-            ratio = (float) lp.width / (float) lp.height;
-        } else if (gal.getWidth() > 0 && gal.getHeight() > 0) {
-            ratio = (float) gal.getWidth() / (float) gal.getHeight();
-        } else {
-            return;
+            if (sb.length() == 0) {
+                sb.append("    <no com.xingin frames>\n");
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "    <stack failed>";
         }
-        if (ratio <= 0.05f || ratio > 20f) {
-            return;
-        }
+    }
 
-        int margin = sMargin;
-        int availW = display.getWidth() - margin * 2;
-        int availH = availableHeight(gal) - sBottom - sTitle - margin * 2;
+    /** 只用于诊断：本次进程里写过多少次 lp。 */
+    private static int sFitWrites = 0;
+
+    /**
+     * 图片目标尺寸：只用「当前屏」的信息算，不看视图当下的位置/尺寸。
+     *
+     * 为什么要这么死板：点进帖子的**第一帧**里，展示区和画廊的位置都还是 0，
+     * 只有屏幕尺寸是确定的。如果测量阶段和绘制前的两处算法不同（一处用屏幕、
+     * 一处用「图片顶到视口底」），第一帧会先按 A 画、再按 B 改一次 —— 这就是
+     * 「点进帖子图片闪一下」。现在两条路径都调这一个函数，结果完全一致，
+     * 尺寸只在进入时定一次，不会再改第二次。
+     */
+    private static int[] fitTargetBox(float ratio, int topOnScreen) {
+        int margin = fMargin;
+        int screenW = currentWidthPx();
+        int screenH = currentScreenHeightPx();
+        if (screenW <= 0 || screenH <= 0) {
+            return null;
+        }
+        int availW = screenW - margin * 2;
+        // 图片不是永远贴在屏幕顶上（上方可能有作者栏/多图分页），
+        // 所以可用高必须扣掉它自己的顶边，否则往下挪一点就顶出下边界。
+        int top = Math.max(topOnScreen, 0);
+        int availH = screenH - top - fBottom - fTitle - margin * 2;
         if (availW <= 0 || availH <= 0) {
-            return;
+            return null;
         }
         int w = availW;
         int h = Math.round(w / ratio);
@@ -840,70 +1094,376 @@ public class MainHook extends XposedModule {
             h = availH;
             w = Math.round(h * ratio);
         }
-        gal.setTag(TAG_FIT, new int[]{w, h, shortSide, Math.round(ratio * 10000f)});
+        return new int[]{w, h, availW, availH};
+    }
+
+    /** 从画廊自己的 lp / 已有缓存里拿到图片原生宽高比。 */
+    private static float ratioOf(View gal, ViewGroup.LayoutParams lp, int[] box) {
+        if (box != null && box.length >= 7 && box[3] > 0) {
+            return box[3] / 10000f;
+        }
+        if (lp != null && lp.width > 0 && lp.height > 0) {
+            return (float) lp.width / (float) lp.height;
+        }
+        if (gal.getWidth() > 0 && gal.getHeight() > 0) {
+            return (float) gal.getWidth() / (float) gal.getHeight();
+        }
+        return -1f;
+    }
+
+    /**
+     * 按当前屏把画廊尺寸定好。测量阶段与绘制前都调它，幂等。
+     * @return 是否真的写入了 lp
+     */
+    private static boolean applyFit(View gal, String why) {
+        ViewGroup.LayoutParams lp = gal.getLayoutParams();
+        if (lp == null) {
+            return false;
+        }
+        int shortSide = currentShortSidePx();
+        int width = currentWidthPx();
+        Object cached = gal.getTag(TAG_FIT);
+        int[] box = cached instanceof int[] && ((int[]) cached).length >= 7 ? (int[]) cached : null;
+        float ratio = ratioOf(gal, lp, box);
+        if (ratio <= 0.05f || ratio > 20f) {
+            return false;
+        }
+
+        int w, h;
+        boolean first;
+        int ratioKey = Math.round(ratio * 10000f);
+        if (box != null && box[2] == shortSide && box[4] == width && box[3] == ratioKey) {
+            // ★ 一旦为这张图定过尺寸，就永远复用这一组数字。
+            //
+            // 之前这里每次都按「图片当前所在位置」重算可用高度，而改尺寸本身
+            // 又会改变它所在的位置 —— 于是目标值每帧都在变：
+            //   1337x1782 → 1211x1615 → 1399x1865 → 1243x1657 …
+            // 这不是小红书在改，是模块自己在跟自己打架（日志里 from 就是上一轮的目标值）。
+            // 现在只有「屏变了 / 屏宽变了 / 比例变了」才重算，其余一律复用。
+            w = box[0];
+            h = box[1];
+            first = false;
+        } else {
+            int top;
+            if (gal.isLaidOut()) {
+                int[] loc = new int[2];
+                try {
+                    gal.getLocationOnScreen(loc);
+                } catch (Throwable ignored) {
+                }
+                top = Math.max(loc[1], 0);
+            } else {
+                // 还是测量阶段，位置拿不到（getLocationOnScreen 这时给 0 或上一次的值）。
+                //
+                // 旧代码在这里 return false 等下一帧，于是「第一次点开」的目标尺寸
+                // 只能在 PreDraw 里写，比小红书画出自己尺寸晚一步 —— 用户看到的
+                // 那个生硬跳变就是这么来的；后面几次因为已经有缓存、走的是复用分支，
+                // 不需要等布局，所以显得「好一点」。
+                //
+                // 现在改成用状态栏高度当图片顶边的估计值，目标尺寸就能在**同一趟
+                // measure/layout** 里生效，第一帧画出来就是终态，没有跳变。
+                // 图片页的图片本来就贴在状态栏下面，误差只剩页面顶部那点 padding。
+                top = statusBarHeightPx();
+            }
+            int[] target = fitTargetBox(ratio, top);
+            if (target == null) {
+                return false;
+            }
+            w = target[0];
+            h = target[1];
+            first = true;
+        }
+
+        if (!fEnlarge) {
+            // 只收不放：当前尺寸已经没有超出可用框的话，什么都不做。
+            boolean fitsNow = lp.width > 0 && lp.height > 0
+                    && lp.width <= w && lp.height <= h;
+            if (fitsNow) {
+                if (first) {
+                    gal.setTag(TAG_FIT, new int[]{w, h, shortSide, ratioKey, width,
+                            lp.width, lp.height});
+                    XposedModule m0 = sModule;
+                    if (m0 != null && sDebug) {
+                        m0.log(Log.INFO, TAG, "FIT keep -> 原尺寸 " + lp.width + "x" + lp.height
+                                + " 本来就在 " + w + "x" + h + " 之内");
+                    }
+                }
+                return false;
+            }
+        }
         if (lp.width == w && lp.height == h) {
+            if (first) {
+                gal.setTag(TAG_FIT, new int[]{w, h, shortSide, ratioKey, width, lp.width, lp.height});
+            }
+            return false;
+        }
+
+        int fromW = lp.width, fromH = lp.height;
+        android.view.ViewGroup.LayoutParams fresh = cloneLp(lp, w, h);
+        gal.setLayoutParams(fresh);
+        if (first) {
+            gal.setTag(TAG_FIT, new int[]{w, h, shortSide, ratioKey, width, fromW, fromH});
+            // v2.6.2：这里**不再**自己叠一层 scaleX/scaleY 过渡。
+            //
+            // 原因：小红书自己就有一段「缩略图 → 大图」的过场动画（它把图片从列表
+            // 位置放大到目标位置）。我们在它上面再补一个 160ms 的 0.81→1 缩放，
+            // 两段运动叠加，第一次点开时就表现为「先硬跳一下再缩放」——也就是用户
+            // 说的「非常生硬」。后面几次因为图片已经缓存在目标尺寸，它的过场变得很
+            // 快，只剩我们的缩放，看起来就「好一点」。
+            //
+            // 现在的原则：尺寸只在**绘制之前**就位（fitBeforeMeasure 里写 lp，
+            // 同一次布局生效；PreDraw 兜底并跳过那一帧），运动完全交给小红书的
+            // 过场动画，模块不再制造第二段运动。
+        }
+        XposedModule m = sModule;
+        if (m != null && sDebug) {
+            m.log(Log.INFO, TAG, "FIT " + why + " -> " + w + "x" + h
+                    + " from=" + fromW + "x" + fromH + (first ? " first" : " reassert"));
+        }
+        return true;
+    }
+
+    /**
+     * 绘制前校正，返回 true 表示「这一帧先别画」。
+     *
+     * 我们在 PreDraw 里改了 LayoutParams，但画面还是上一次测量的尺寸 ——
+     * 如果照常绘制，用户就会看到「小红书尺寸的那一帧」。返回 false 取消这次绘制，
+     * 上一帧的画面会保留着（不是黑屏），下一帧就是我们想要的尺寸了。
+     * 每个画廊最多跳过 2 帧，避免万一陷入来回改写时把页面卡住。
+     */
+    private static boolean fitOneGallery(View gal, View display) {
+        try {
+            if (galleryWrites(gal) >= 2) {
+                return false;      // 已经改写过两次还在被改回去：彻底放手，避免无限抢尺寸
+            }
+            boolean wrote = applyFit(gal, "draw");
+            if (!wrote) {
+                return false;
+            }
+            if (galleryWrites(gal) >= 2) {
+                return false;      // 已经跳过两帧，别再跳过，防止页面卡住
+            }
+            bumpGalleryWrites(gal);
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private static final int TAG_FIT_SKIP = 0x584853_4A;   // 'XHSJ'
+
+    private static int galleryWrites(View gal) {
+        Object v = gal.getTag(TAG_FIT_SKIP);
+        return v instanceof Integer ? (Integer) v : 0;
+    }
+
+    private static void bumpGalleryWrites(View gal) {
+        gal.setTag(TAG_FIT_SKIP, galleryWrites(gal) + 1);
+    }
+
+        /**
+     * 测量前先把尺寸定好：这时候父容器还没给子视图算过尺寸，
+     * 我们现在写的 lp 会在**同一次布局**里生效，因此第一帧就是最终大小，不会闪。
+     */
+    private static void fitBeforeMeasure(View display) {
+        if (!fFill || !isPortrait() || !(display instanceof ViewGroup)) {
             return;
         }
-        lp.width = w;
-        lp.height = h;
-        gal.setLayoutParams(lp);
-        XposedModule m = sModule;
-        if (m != null) {
-            if (sDebug) {
-                m.log(Log.INFO, TAG, "FIT gallery -> " + w + "x" + h
-                        + " ratio=" + ratio + " avail=" + availW + "x" + availH);
+        try {
+            Object cachedGal = display.getTag(TAG_FIT_GAL);
+            if (cachedGal instanceof View) {
+                View gal = (View) cachedGal;
+                if (gal.getParent() != null) {
+                    applyFit(gal, "measure");
+                    return;
+                }
+                display.setTag(TAG_FIT_GAL, null);
             }
+            fitGalleryIn((ViewGroup) display, display, 0);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static volatile Class<?> sGalleryClass = null;
+
+    /** 状态栏高度（首次定位图片顶边时用，作为「还没布局好」时的估计值）。 */
+    private static int statusBarHeightPx() {
+        try {
+            android.content.Context ctx = currentContext();
+            if (ctx != null) {
+                android.content.res.Resources r = ctx.getResources();
+                int id = r.getIdentifier("status_bar_height", "dimen", "android");
+                if (id > 0) {
+                    return r.getDimensionPixelSize(id);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return 0;
+    }
+
+    private static int topEstimate(View v) {
+        try {
+            int[] loc = new int[2];
+            v.getLocationOnScreen(loc);
+            if (v.isLaidOut() && loc[1] > 0) {
+                return loc[1];
+            }
+        } catch (Throwable ignored) {
+        }
+        return statusBarHeightPx();
+    }
+
+    /**
+     * 在**写 LayoutParams 的那一刻**就把宽高改成目标值。
+     *
+     * 这是唯一能消掉「先按小红书尺寸画一帧」的位置：小红书是先 setLayoutParams、
+     * 再测量、再布局、再绘制，我们在它写进去的同一瞬间改掉，它测量的就已经是
+     * 最终尺寸，第一帧（包括打开动画里的那些帧）就是对的。
+     *
+     * 全局挂 `View.setLayoutParams`，但只用一次 instanceof 判断把无关的调用放过去。
+     */
+    private void installGalleryLpHook(ClassLoader cl) {
+        try {
+            sGalleryClass = Class.forName(GALLERY_FQN, false, cl);
+        } catch (Throwable t) {
+            XposedModule m = sModule;
+            if (m != null) {
+                m.log(Log.WARN, TAG, "gallery class not found: " + t);
+            }
+            return;
+        }
+        int hooked = 0;
+        // 沿继承链逐个挂：ImageGalleryView 自己不声明 setLayoutParams，
+        // 但它继承的类是重写过的（RecyclerView 就重写了），只挂 View 的声明会漏掉。
+        for (Class<?> c = sGalleryClass; c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                final Method slp = c.getDeclaredMethod(
+                        "setLayoutParams", android.view.ViewGroup.LayoutParams.class);
+                slp.setAccessible(true);
+                hook(slp).intercept(chain -> {
+                    try {
+                        Class<?> g = sGalleryClass;
+                        Object self = chain.getThisObject();
+                        if (g != null && fFill && isPortrait() && g.isInstance(self)) {
+                            Object lp = chain.getArgs().get(0);
+                            if (lp instanceof android.view.ViewGroup.LayoutParams) {
+                                rewriteGalleryLp((View) self,
+                                        (android.view.ViewGroup.LayoutParams) lp);
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                    return chain.proceed();
+                });
+                hooked++;
+            } catch (Throwable ignored) {
+            }
+        }
+        XposedModule m = sModule;
+        if (m != null && sDebug) {
+            m.log(Log.INFO, TAG, "hooked setLayoutParams on " + hooked + " classes in the chain");
+        }
+        if (hooked == 0 && m != null) {
+            m.log(Log.WARN, TAG, "setLayoutParams not hookable on gallery chain");
         }
     }
 
     /**
-     * 这张图片实际能占的高度：从图片当前位置到可滚动视口的底边。
-     *
-     * 之前用「滚动容器总高」当上限，比真实可用空间多了「图片顶到视口顶」的那段
-     * （外屏实测多出 135px），竖图就顶出了屏幕。改成按屏幕坐标算：
-     *   视口底边 = 最近 NestedScrollLayout 祖先的 bottom（屏幕坐标）
-     *   可用高   = 视口底边 - 图片当前 top（屏幕坐标）
-     * 结果只在「比例变化 / 换屏」时重算并缓存在 View 上，
-     * 滚动过程中不会因为 top 变化而反复改尺寸。
+     * 诊断（只在 debug 打开时安装）：抓 gallery 触发 requestLayout 时的调用栈，
+     * 用来定位小红书是在哪个方法里算好尺寸并写进 LayoutParams 的。
+     * requestLayout 是超热方法，所以正式版（sDebug=false）根本不安装。
      */
-    private static int availableHeight(View gal) {
+
+    private static android.view.ViewGroup.LayoutParams cloneLp(
+            android.view.ViewGroup.LayoutParams src, int w, int h) {
         try {
-            int[] loc = new int[2];
-            gal.getLocationOnScreen(loc);
-            int bottom = viewportBottom(gal);
-            int h = bottom - loc[1];
-            if (h > 0) {
-                return h;
+            java.lang.reflect.Constructor<?> c = src.getClass().getConstructor(int.class, int.class);
+            Object o = c.newInstance(w, h);
+            for (String f : new String[]{"gravity", "weight", "leftMargin", "rightMargin",
+                    "topMargin", "bottomMargin"}) {
+                copyField(src, o, f);
             }
+            return (android.view.ViewGroup.LayoutParams) o;
+        } catch (Throwable t) {
+            src.width = w;
+            src.height = h;
+            return src;
+        }
+    }
+
+    private static void copyField(Object from, Object to, String name) {
+        try {
+            java.lang.reflect.Field f = from.getClass().getField(name);
+            f.set(to, f.get(from));
         } catch (Throwable ignored) {
         }
-        android.content.Context ctx = currentContext();
-        if (ctx != null) {
-            android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
-            return (int) (dm.heightPixels * 0.80f);
-        }
-        return 0;
     }
 
-    private static int viewportBottom(View from) {
-        View v = from;
-        for (int i = 0; i < 8 && v != null; i++) {
-            if (v.getClass().getName().contains("NestedScrollLayout") && v.getHeight() > 0) {
-                int[] loc = new int[2];
-                v.getLocationOnScreen(loc);
-                return loc[1] + v.getHeight();
+    private static void rewriteGalleryLp(View gal, android.view.ViewGroup.LayoutParams lp) {
+        float ratio = ratioOf(gal, lp, null);
+        if (ratio <= 0.05f || ratio > 20f) {
+            return;
+        }
+        // ★ 先看缓存：这张图的尺寸一旦定过，任何路径都只能复用那一组数字。
+        // 之前这里又按「当前位置」重算了一遍，于是同一条帖子在
+        // 1337x1782 与 1326x1767 之间来回横跳（差 20px 的顶边就能换出另一个目标值）。
+        Object cached = gal.getTag(TAG_FIT);
+        if (cached instanceof int[] && ((int[]) cached).length >= 7) {
+            int[] box = (int[]) cached;
+            if (box[0] > 0 && box[1] > 0) {
+                if (lp.width != box[0] || lp.height != box[1]) {
+                    lp.width = box[0];
+                    lp.height = box[1];
+                }
+                return;
             }
-            v = v.getParent() instanceof View ? (View) v.getParent() : null;
         }
-        android.content.Context ctx = currentContext();
-        if (ctx != null) {
-            android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
-            return dm.heightPixels - 130;
+        int[] target = fitTargetBox(ratio, topEstimate(gal));
+        if (target == null) {
+            return;
         }
-        return 0;
+        int w = target[0], h = target[1];
+        if (lp.width == w && lp.height == h) {
+            return;
+        }
+        int fromW = lp.width, fromH = lp.height;
+        lp.width = w;
+        lp.height = h;
+        gal.setTag(TAG_FIT, new int[]{w, h, currentShortSidePx(),
+                Math.round(ratio * 10000f), currentWidthPx(), fromW, fromH});
+        XposedModule m = sModule;
+        if (m != null && sDebug) {
+            m.log(Log.INFO, TAG, "LP rewrite -> " + w + "x" + h + " from=" + fromW + "x" + fromH);
+        }
     }
 
-    private static void dumpNode(View v, int depth, XposedModule m, int[] lines) {
+    /** 装上测量前的兜口：AsyncImageDisplayView.onMeasure 一进来就把图片尺寸定好。 */
+    private void installMeasureFit(ClassLoader cl) {
+        try {
+            Class<?> display = Class.forName(DISPLAY_CLASS, false, cl);
+            Method om = display.getDeclaredMethod("onMeasure", int.class, int.class);
+            om.setAccessible(true);
+            hook(om).intercept(chain -> {
+                try {
+                    fitBeforeMeasure((View) chain.getThisObject());
+                } catch (Throwable ignored) {
+                }
+                return chain.proceed();
+            });
+            XposedModule m = sModule;
+            if (m != null && sDebug) {
+                m.log(Log.INFO, TAG, "hooked onMeasure for pre-measure fit");
+            }
+        } catch (Throwable t) {
+            XposedModule m = sModule;
+            if (m != null) {
+                m.log(Log.WARN, TAG, "hook onMeasure failed: " + t);
+            }
+        }
+    }
+
+        private static void dumpNode(View v, int depth, XposedModule m, int[] lines) {
         if (v == null || depth > 16 || lines[0] >= DUMP_MAX_LINES) {
             return;
         }
@@ -970,13 +1530,14 @@ public class MainHook extends XposedModule {
             final boolean outer = isOuterContainer(cn);
             final boolean gutter = needsGutter(cn);
             final boolean display = cn.contains("AsyncImageDisplayView");
-            final int want = outer ? 0 : (gutter ? sPad : -1);
+            final int want = outer ? 0 : (gutter ? fPad : -1);
             final ViewTreeObserver.OnPreDrawListener l =
                     new ViewTreeObserver.OnPreDrawListener() {
                 private int frame = 0;
 
                 @Override
                 public boolean onPreDraw() {
+                    boolean skipThisFrame = false;
                     try {
                         // want < 0 表示这既不是外层也不是内容区，无需干预
                         // 守卫常驻：只做一次整数比较，开销可忽略。
@@ -994,8 +1555,13 @@ public class MainHook extends XposedModule {
                         if (sTree && outer) {
                             dumpTreeIfDue(v, "detail");
                         }
-                        if (sFill && display) {
-                            fitGallery(v);
+                        if (display) {
+                            // 竖屏:按可用空间放大;横屏:把尺寸还给小红书(见 fitGallery)
+                            if (fFill) {
+                                skipThisFrame = fitGalleryAndMaybeSkip(v);
+                            } else {
+                                releaseFit(v);
+                            }
                         }
 
                         if (VERBOSE && frame < 20) {
@@ -1039,7 +1605,7 @@ public class MainHook extends XposedModule {
                         }
                     } catch (Throwable ignored) {
                     }
-                    return true; // 不取消绘制
+                    return !skipThisFrame; // false = 这一帧先不画（尺寸刚要变）
                 }
             };
             v.getViewTreeObserver().addOnPreDrawListener(l);
@@ -1326,6 +1892,9 @@ public class MainHook extends XposedModule {
     /** 当前屏的宽度像素（横竖屏不同）。小红书算列数用的是它，不是短边。 */
     private static volatile int sScreenWidth = 0;
 
+    /** 当前屏的高度像素（横屏时是短边）。 */
+    private static volatile int sScreenHeight = 0;
+
     /**
      * 当前是否竖屏。
      *
@@ -1477,6 +2046,7 @@ public class MainHook extends XposedModule {
         try {
             java.io.File f = new java.io.File(CONF_PATH);
             if (!f.exists()) {
+                recomputeCombo();
                 if (sDebug) {
                     log(Log.INFO, TAG, "conf absent, defaults tree=" + sTree + " fill=" + sFill
                             + " pad=" + sPad + " margin=" + sMargin);
@@ -1490,6 +2060,7 @@ public class MainHook extends XposedModule {
             } finally {
                 in.close();
             }
+            sConf = p;
             sTree = boolConf(p, "tree", DEBUG_TREE);
             sFill = boolConf(p, "fill", true);
             sPad = intConf(p, "pad", PAD_TARGET);
@@ -1498,6 +2069,7 @@ public class MainHook extends XposedModule {
             sTitle = intConf(p, "title", 150);
             sSpanForce = boolConf(p, "spanforce", true);
             sDebug = boolConf(p, "debug", false);
+            recomputeCombo();
             if (sDebug) {
                 log(Log.INFO, TAG, "conf tree=" + sTree + " fill=" + sFill
                         + " pad=" + sPad + " margin=" + sMargin);
@@ -1548,15 +2120,18 @@ public class MainHook extends XposedModule {
                 portrait = hDp >= wDp;
             }
             int widthPx = Math.round((portrait ? Math.min(wDp, hDp) : Math.max(wDp, hDp)) * density);
+            int heightPx = Math.round((portrait ? Math.max(wDp, hDp) : Math.min(wDp, hDp)) * density);
             int shortPx = Math.round(Math.min(wDp, hDp) * density);
             boolean changed = portrait != sPortrait || shortPx != sScreenShort
                     || widthPx != sScreenWidth;
             sPortrait = portrait;
             sScreenWidth = widthPx;
+            sScreenHeight = heightPx;
             sScreenShort = shortPx;
             if (changed) {
                 sCachedTag = -1;    // 换屏/换方向后重新按当前屏读一次档位
             }
+            recomputeCombo();       // 组合参数按当前屏/方向取一次(几个 Properties 查表,便宜)
             if (changed) {
                 XposedModule m = sModule;
                 if (m != null) {
@@ -1584,6 +2159,20 @@ public class MainHook extends XposedModule {
             return dm.widthPixels;
         }
         return currentShortSidePx();
+    }
+
+    /** 当前屏高度像素（横屏时是短边）。 */
+    private static int currentScreenHeightPx() {
+        int fromActivity = sScreenHeight;
+        if (fromActivity > 0) {
+            return fromActivity;
+        }
+        android.content.Context ctx = currentContext();
+        if (ctx != null) {
+            android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+            return dm.heightPixels;
+        }
+        return 0;
     }
 
     private static boolean isPortrait() {
@@ -1961,7 +2550,7 @@ public class MainHook extends XposedModule {
      * 第一帧就是对的；再补一次 150ms 后的幂等复检，防止列表随后被重建。
      */
     private static void applyFeedSpan(final ClassLoader cl, final String why, final boolean immediate) {
-        if (!sSpanForce) {
+        if (!fSpanForce) {
             return;
         }
         // 横屏交给小红书自己：它按真实宽度分档，我们不去覆盖。

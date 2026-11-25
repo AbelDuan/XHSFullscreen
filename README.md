@@ -528,3 +528,102 @@ v2.1.7 之前这里每帧都会递归下潜 3 层找 `ImageGalleryView`(每次 `
 - 存储读写 `h.j` / `h.u` 只在 key 是 `screen_scale_sp_key` 时才改写参数,
   其它键一次判等就 `proceed()`;
 - 类查找有缓存(`sStoreClass` / `sScaleClass`),dex 特征扫描只在混淆名变动时跑一次。
+
+## 按「屏 + 方向」分别配置(v2.1.9)
+
+模块本身已经知道两件事:**在哪块屏**(`sScreenShort` 与 `sDivider`(=1420) 比较,1671=内屏、1168=外屏)
+和**什么方向**(`Configuration.orientation`)。两者拼成四个组合名:
+
+```
+inner_portrait   inner_landscape   outer_portrait   outer_landscape
+```
+
+配置文件里任何参数都能只对某个组合覆盖,写法 `键_组合名`;
+查找顺序是 `键_组合名` → `键` → 内置默认值,所以只写通用键就是四屏统一。
+
+```ini
+# /data/local/tmp/xhsfullscreen.conf
+pad=45                 # 内容区左右内边距
+margin=22              # 图片左右留白
+bottom=110             # 底部输入条预留
+title=150              # 图片下方标题预留
+fill=1                 # 竖屏默认开;横屏默认关(交还小红书)
+spanforce=1            # 换屏后同步列数
+debug=0                # 调试日志
+
+title_outer_portrait=120     # 只改外屏竖屏
+fill_inner_landscape=0       # 内屏横屏不接管图片
+margin_inner_portrait=18
+```
+
+生效方式是**换屏/换向时重算一次**并存到字段里(`recomputeCombo()`),
+PreDraw 热路径只读字段,不做属性查表。
+
+### v2.1.9 同时修掉的两个尺寸 bug
+
+1. **宽度取到中间态**:内屏第一帧 `display.getWidth()` 是 1063、稳定后 1671。
+   按 1063 算出来的图明显偏小,而且一旦按小尺寸写回 lp,后续帧命中我们自己的缓存
+   就直接返回 —— 尺寸永远停在偏小值上。修法:记录上一帧的展示区宽度,不一致就等下一帧
+   (`TAG_FIT_W`),稳定后才算。
+2. **兜底高度拿到另一块屏**:`viewportBottom()` 找不到 `NestedScrollLayout` 时用的是
+   Application 的 `DisplayMetrics`,换屏后可能还是另一块屏的(外屏 1712 上拿到内屏 2364),
+   算出来比屏幕还大,图片就顶出屏幕。修法:可用高/可用宽一律以 `Configuration` 推出的
+   **当前屏**尺寸封顶(`currentScreenHeightPx()` / `currentWidthPx()`)。
+
+另外:图片的**原生宽高比**改成第一次算出来就缓存在 tag 里(`box[3]`),换向/重排后
+即使 lp 被别人改了,也不会拿被改过的 lp 反推比例;`releaseFit()` 负责在横屏时把
+我们写过的那一次 lp 还原成小红书原本的值(`box[5]`/`box[6]`)。
+
+## 默认「只收不放」(v2.5.0)
+
+v2.4.x 及以前默认把详情页图片放大到「一屏尽量大」。但取证表明小红书在图片打开后
+会把 `LayoutParams` 改回它自己的值——**宽度上限恒为 1086px**（≈496dp，约等于
+0.65 × 内屏宽度），高度按图片比例推：
+
+| 图片比例 | 小红书给的尺寸 |
+| --- | --- |
+| 0.75（竖图 3:4） | 1086 × 1448 |
+| 0.84 | 1086 × 1293 |
+| 1.334（横图） | 1086 × 814 |
+
+它改回来的方式既不走 `View.setLayoutParams`（沿继承链全挂了、零命中），
+也不走 `View.requestLayout`（探针零命中），而是直接改字段或在 RecyclerView
+内部重绑定时替换。也就是说「放大」这件事在显示层是抢不过来的，必然表现为
+一次可见的尺寸变化。
+
+所以默认改成 **只收不放**：
+
+- 图片本来就放得下（`lp.width <= 可用宽 && lp.height <= 可用高`）→ **完全不动**，
+  打开时没有任何尺寸变化；
+- 图片超出屏幕（常见于全幅视频帧、超长图）→ 才缩回屏幕内，这是必要的修正。
+
+想恢复放大：`enlarge=1`，也可以只对某个组合打开，例如
+`enlarge_outer_portrait=1`、`enlarge_inner_portrait=1`。
+
+### 其它几条与尺寸相关的结论
+
+- **实况照片（Live Photo）完全放行**：链路是
+  `NoteDetailLivePhotoItemPresenter` / `AsyncPhotoNoteLivePhotoItemController` /
+  `capa/components/widgets/video/LocalLivePhotoPlayer`，播放器每个布局周期都会
+  重新给自己尺寸，改写就会被无限改回 → 严重闪烁。判断依据是画廊里存在类名含
+  `livephoto` 的子视图。
+- **改写上限 2 次**：任何画廊被改写两次之后仍然被改回去，就彻底放手，
+  避免「每帧对撞」。静态图的正常路径是 `first` + 一次 `reassert`，正好在额度内。
+- 尺寸变化的那一帧在 `OnPreDrawListener` 里返回 `false` 取消绘制
+  （保留上一帧画面，不是黑屏），下一帧直接按新尺寸画出来，最多跳过 2 帧。
+
+## v2.6.1 结论：实况照片的闪烁是小红书自己的
+
+用户实测：**关掉模块**后点开实况照片仍然闪烁 ⇒ 与模块无关。之前的
+`releaseFit` 每帧都判一次实况并在命中时写回尺寸，等于我们还是参与了一次
+尺寸对撞，客观上让情况更糟。
+
+所以 v2.6.1：
+
+- `fit` / `enlarge` 恢复为**默认开启**（v2.5.0 的「只收不放」撤回，普通图片仍是
+  放大到一屏尽量大）；
+- 实况照片判定一次后打 `TAG_LIVE` 标记（`0x58485348`），此后那条画廊
+  **完全不参与**任何尺寸改写：不写 lp、不跳帧、不再重复 `releaseFit`；
+- 判定发生在三处入口（首发发现画廊、跳过版 PreDraw、普通 apply），避免漏网。
+
+实况照片的闪烁属于小红书自己的播放器刷新，模块侧只保证「不加戏」。
