@@ -1628,7 +1628,14 @@ public class MainHook extends XposedModule {
      * 名字每次大版本都可能变，写在这里只是为了「快」——真正的兜底是
      * scanDexForStore 的结构匹配（静态 g() 返回自身 + j(String,int)I + u(String,int)V）。
      */
-    private static final String[] STORE_HINTS = {"p7e.h", "q3e.h", "s3e.h", "r3e.h", "t3e.h"};
+    // 已知的存储封装类名，按版本从新到旧。混淆名会随版本变：
+    //   9.54.0 q3e.h / 9.54.1 s3e.h / 9.55.0 p7e.h / 9.56.0 cce.h
+    // 新版本若又改名，用下面的方法找（已验证可复现）：
+    //   1) 在 dex 里搜字符串 "screen_scale_sp_key"，命中类就是档位控制类 ms.n；
+    //   2) 反编译 ms.n.<clinit>() 与 ms.n.m(I,F)I，里面会 `invoke-static Lcce/h;->g()`
+    //      与 `invoke-virtual Lcce/h;->u(Ljava/lang/String;I)V`；
+    //   3) 该类即存储封装类，结构恒为：static g()返回自身 + j(String,int)I + u(String,int)V。
+    private static final String[] STORE_HINTS = {"cce.h", "p7e.h", "q3e.h", "s3e.h", "r3e.h", "t3e.h"};
 
     /**
      * 找到小红书的键值存储封装类。

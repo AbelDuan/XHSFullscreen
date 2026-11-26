@@ -627,3 +627,57 @@ v2.4.x 及以前默认把详情页图片放大到「一屏尽量大」。但取�
 - 判定发生在三处入口（首发发现画廊、跳过版 PreDraw、普通 apply），避免漏网。
 
 实况照片的闪烁属于小红书自己的播放器刷新，模块侧只保证「不加戏」。
+
+## 小红书 9.56.0 适配（v2.6.3）
+
+9.56.0 把存储封装类的混淆名从 `p7e.h` 改成 **`cce.h`**，模块原本只按旧名快查、
+`dexElements` 特征扫描在 LSPosed 进程里又拿不到类清单，于是 `installSplitScreenScale`
+真的失败了：
+
+```
+E installSplitScreenScale failed: java.lang.ClassNotFoundException: store class not found by signature
+```
+
+后果是「内外屏列数各自保留」整套失效——`screen_scale_sp_key` 不再被改写成
+`_inner` / `_outer` 两份，两块屏共用同一个档位。
+
+### 怎么确认哪个类是新存储封装
+
+1. 在 dex 里搜字符串 `screen_scale_sp_key`，命中的类就是档位控制类 `ms.n`
+   （9.56.0 里仍是这个名字）；
+2. 反编译 `ms.n.<clinit>()` 与 `ms.n.m(I,F)I`，能看到
+   `invoke-static Lcce/h;->g()Lcce/h;` 与
+   `invoke-virtual Lcce/h;->u(Ljava/lang/String;I)V`；
+3. 该类的结构在所有版本里都恒定为：
+
+   | 成员 | 签名 |
+   | --- | --- |
+   | 单例 | `static g()` 返回自身 |
+   | 读 | `j(String, int) -> int` |
+   | 写 | `u(String, int) -> void` |
+
+   用 `grep -a 'Lcce/h;'` 找它定义在哪个 dex（9.56.0 是 `classes14.dex`），
+   再用上面的三条签名确认，就能安全地把名字加进 `STORE_HINTS`。
+
+### 9.56.0 里没变的部分
+
+- `ms.n` 仍是档位控制类，`a()I` / `e(I)I` / `f(Context)I` / `g(I,F)I` / `m(I,F)I`
+  与静态字段 `d:I`、`b:Z` 全部不变；
+- 枚举 `ms.n$c { NORMAL, ZOOM_IN, ZOOM_OUT }` 不变（`ms.n$d` 还多出 `LAGE` 一档，
+  与列数档位无关）；
+- `ImageGalleryView` / `AsyncImageDisplayView` 等 `com.xingin.matrix.*` 类名不变，
+  详情页图片适配不受影响。
+
+### 验证方法（本机实测）
+
+```
+I hooked SP read j(String,int)
+I hooked SP write u(String,int)
+I screen state -> short=1168 width=1168 portrait (cfg 534x783 @350)
+I switch screen -> reload scale, tag=outer value=2
+```
+
+外屏 `short=1168 < divider` → `tag=outer`，读的就是 `screen_scale_sp_key_outer`。
+`/data/user/0/com.xingin.xhs/files/mmkv/com.xingin.xhs_preferences` 里能同时看到
+`screen_scale_sp_key_outer` 与 `screen_scale_sp_key_inner` 两个键，说明两份档位都
+在独立保存。
